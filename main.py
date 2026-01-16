@@ -36,7 +36,7 @@ logger.add(
 # DeepgramClient will be instantiated per session inside ws_chat
 
 # MongoDB Setup
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://vanshikaverma:Test_123@bharatlogic.ngkrzdr.mongodb.net/")
+MONGO_URI = os.getenv("MONGO_URI")
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["voice_bot_db"]
 conversations_collection = db["conversations"]
