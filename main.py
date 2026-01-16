@@ -16,6 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from deepgram import DeepgramClient
 from loguru import logger
 import uvicorn
+import uuid
+from pymongo import MongoClient
+from datetime import datetime
+import os
 
 from pysilero_vad import SileroVoiceActivityDetector
 from agent import SimpleAgent
@@ -28,7 +32,29 @@ logger.add(
     format="<green>{time:HH:mm:ss}</green> | <level>{level}</level> | <level>{message}</level>",
 )
 
+
 # DeepgramClient will be instantiated per session inside ws_chat
+
+# MongoDB Setup
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://vanshikaverma:Test_123@bharatlogic.ngkrzdr.mongodb.net/")
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client["voice_bot_db"]
+conversations_collection = db["conversations"]
+
+def save_conversation_summary(session_id: str, summary: str, user_data: dict):
+    """Saves the conversation summary to MongoDB."""
+    try:
+        document = {
+            "session_id": session_id,
+            "timestamp": datetime.utcnow(),
+            "summary": summary,
+            "user_data": user_data
+        }
+        conversations_collection.insert_one(document)
+        logger.info(f"Summary saved for session {session_id}")
+    except Exception as e:
+        logger.error(f"Failed to save summary: {e}")
+
 
 def audio_to_bytes(audio: Tuple[int, np.ndarray]) -> bytes:
     """Convert audio tuple to WAV bytes with 44-byte header."""
@@ -107,6 +133,25 @@ class SileroVADWrapper:
 
 # ==================== AUDIO PROCESSING ====================
 
+def clean_text_for_tts(text: str) -> str:
+    """Removes Markdown characters and extra punctuation for cleaner speech."""
+    import re
+    # Remove bold/italic (**, *, __, _)
+    text = re.sub(r'(\*\*|\*|__|_)', '', text)
+    # Remove headers (#)
+    text = re.sub(r'#+\s*', '', text)
+    # Remove list markers at start of lines (-, +, *, 1., 2.)
+    text = re.sub(r'^\s*([-+*]|\d+\.)\s+', '', text, flags=re.MULTILINE)
+    # Remove links [text](url) -> text
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    # Remove code blocks and backticks
+    text = re.sub(r'(`|```[a-z]*\n|```)', '', text)
+    # Replace newlines with spaces
+    text = text.replace('\n', ' ')
+    # Normalize spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
 def transcribe_audio(audio: Tuple[int, np.ndarray], dg_client: DeepgramClient) -> str:
     """Transcribe audio using Deepgram Nova-3 REST API."""
     audio_bytes = audio_to_bytes(audio)
@@ -158,10 +203,24 @@ def text_to_speech(text: str, dg_client: DeepgramClient) -> Generator[Tuple[int,
 def process_chat_common(text: str, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, suppress_tts: bool = False) -> Generator:
     """Shared pipeline: Agent -> per-sentence TTS (if not suppressed)."""
     
+
     # Check for explicit 'clear' command (no AI response needed)
     clean_text = text.lower().strip().strip('.').strip('!').strip('?')
+    
     if clean_text in ["clear history", "clear"]:
         logger.info("Manual clear triggered")
+        
+        # correct: generate and save summary before clearing
+        try:
+             # Generate summary
+            summary = session_agent.generate_summary()
+            
+            # Save to DB
+            session_id = session_history[0].get("session_id") if session_history and "session_id" in session_history[0] else str(uuid.uuid4())
+            save_conversation_summary(session_id, summary, session_agent.user_data)
+        except Exception as e:
+            logger.error(f"Error saving summary on clear: {e}")
+
         session_history.clear()
         session_agent.clear_history()
         yield ("clear", None)
@@ -195,23 +254,28 @@ def process_chat_common(text: str, session_agent: SimpleAgent, session_history: 
                     trigger = False
                     if not first_chunk_sent:
                         word_count = len(current_chunk.strip().split())
-                        if any(current_chunk.rstrip().endswith(e) for e in first_chunk_endings) or word_count >= 4:
+                        # Increased threshold to 8 words for smoother first chunk
+                        if any(current_chunk.rstrip().endswith(e) for e in first_chunk_endings) or word_count >= 8:
                             trigger = True
                     else:
                         if any(current_chunk.rstrip().endswith(e) for e in sentence_endings):
                             trigger = True
 
                     if trigger and len(current_chunk.strip()) > 2:
-                        logger.info(f'TTS Trigger ({"Fast" if not first_chunk_sent else "Sentence"}): "{current_chunk.strip()}"')
-                        for audio_chunk in text_to_speech(current_chunk.strip(), dg_client):
-                            yield ("audio", audio_chunk)
+                        clean_text = clean_text_for_tts(current_chunk.strip())
+                        if clean_text:
+                            logger.info(f'TTS Trigger ({"Fast" if not first_chunk_sent else "Sentence"}): "{clean_text}"')
+                            for audio_chunk in text_to_speech(clean_text, dg_client):
+                                yield ("audio", audio_chunk)
                         current_chunk = ""
                         first_chunk_sent = True
         
         if not suppress_tts and current_chunk.strip():
-            logger.info(f'TTS Trigger (final): "{current_chunk.strip()}"')
-            for audio_chunk in text_to_speech(current_chunk.strip(), dg_client):
-                yield ("audio", audio_chunk)
+            clean_text = clean_text_for_tts(current_chunk.strip())
+            if clean_text:
+                logger.info(f'TTS Trigger (final): "{clean_text}"')
+                for audio_chunk in text_to_speech(clean_text, dg_client):
+                    yield ("audio", audio_chunk)
         
         session_history.append({"role": "assistant", "content": full_response})
         yield ("chat_assistant", full_response)
@@ -221,8 +285,20 @@ def process_chat_common(text: str, session_agent: SimpleAgent, session_history: 
         ai_clean = full_response.lower()
         end_phrases = ["goodbye", "bye", "end call", "thank you goodbye", "thanks bye", "have a good day", "have a great day"]
         
+
         if any(p in user_clean for p in end_phrases) or any(p in ai_clean for p in end_phrases):
             logger.info("End phrase detected. Shutting down after playback.")
+            
+            # Generate and save summary
+            try:
+                summary = session_agent.generate_summary()
+                # We need to access session_id, which we'll stash in history or pass in. 
+                # For now, let's grab it if we put it in history, otherwise generate new (not ideal but safe)
+                session_id = session_history[0].get("session_id") if session_history and "session_id" in session_history[0] else str(uuid.uuid4())
+                save_conversation_summary(session_id, summary, session_agent.user_data)
+            except Exception as e:
+                logger.error(f"Error saving summary on shutdown: {e}")
+
             session_history.clear()
             session_agent.clear_history()
             yield ("shutdown", None)
@@ -293,11 +369,12 @@ HTML_PAGE = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Voice Agent</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
             font-family: 'Inter', -apple-system, sans-serif; 
-            background: #000814; 
+            background: #0a1628; 
             color: #ffffff; 
             display: flex; 
             justify-content: center; 
@@ -360,6 +437,23 @@ HTML_PAGE = """
             align-self: flex-start; 
             border-bottom-left-radius: 4px;
         }
+        .msg.bot ul, .msg.bot ol { 
+            padding-left: 1.5rem; 
+            margin: 0.75rem 0;
+            list-style-position: outside;
+        }
+        .msg.bot li { 
+            margin-bottom: 0.5rem; 
+            padding-left: 0.2rem;
+        }
+        .msg.bot li::marker {
+            color: #00f5ff;
+            font-weight: bold;
+        }
+        .msg.bot p { margin-bottom: 0.75rem; }
+        .msg.bot p:last-child { margin-bottom: 0; }
+        .msg.bot strong { color: #00f5ff; }
+        .msg.bot a { color: #00f5ff; }
         .msg.interrupted { border-left: 3px solid #ff4b4b; color: rgba(224, 224, 224, 0.6); font-style: italic; }
         .msg.typing::after { content: "▋"; animation: blink 1s infinite; margin-left: 2px; color: #00f5ff; }
         @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
@@ -438,7 +532,6 @@ HTML_PAGE = """
         .icon-btn svg { width: 1.2rem; height: 1.2rem; }
 
         .btn-clear { background: transparent; color: rgba(255, 255, 255, 0.2); border: none; font-size: 0.65rem; cursor: pointer; text-transform: uppercase; letter-spacing: 0.08em; align-self: center; margin-top: 0.5rem; }
-        .btn-clear:hover { color: #ff4b4b; }
         .placeholder { flex: 1; display: flex; align-items: center; justify-content: center; color: rgba(255, 255, 255, 0.15); font-size: 0.85rem; text-align: center; }
     </style>
 </head>
@@ -523,6 +616,7 @@ HTML_PAGE = """
         }
 
         async function startWebSocketOnly() {
+            if (!pCtx) pCtx = new (window.AudioContext || window.webkitAudioContext)();
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${proto}//${location.host}/ws/chat`);
             ws.binaryType = 'arraybuffer';
@@ -533,6 +627,9 @@ HTML_PAGE = """
             });
         }
 
+        let audioBuffer = [];
+        const CHUNK_SIZE = 4096;
+
         async function start() {
             try {
                 if (!pCtx) pCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -540,18 +637,47 @@ HTML_PAGE = """
 
                 stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 } });
                 aCtx = new AudioContext({ sampleRate: 16000 });
+                
+                // AudioWorklet for smoother processing
+                const workletCode = `
+                  class PCMProcessor extends AudioWorkletProcessor {
+                    process(inputs, outputs, parameters) {
+                      const input = inputs[0];
+                      if (input.length > 0) {
+                        this.port.postMessage(input[0]);
+                      }
+                      return true;
+                    }
+                  }
+                  registerProcessor('pcm-processor', PCMProcessor);
+                `;
+                const blob = new Blob([workletCode], { type: 'application/javascript' });
+                await aCtx.audioWorklet.addModule(URL.createObjectURL(blob));
+
                 const src = aCtx.createMediaStreamSource(stream);
-                proc = aCtx.createScriptProcessor(4096, 1, 1);
-                proc.onaudioprocess = (e) => {
+                const node = new AudioWorkletNode(aCtx, 'pcm-processor');
+                
+                node.port.onmessage = (e) => {
                     if (!running || !ws || ws.readyState !== 1) return;
-                    const d = e.inputBuffer.getChannelData(0);
-                    updateViz(d);
-                    const p = new Int16Array(d.length);
-                    for (let i = 0; i < d.length; i++) p[i] = Math.max(-32768, Math.min(32767, d[i] * 32768));
-                    ws.send(p.buffer);
+                    
+                    // Buffer chunks (Worklet is ~128 samples, we want ~4096)
+                    const chunks = e.data;
+                    for (let i = 0; i < chunks.length; i++) audioBuffer.push(chunks[i]);
+                    
+                    if (audioBuffer.length >= CHUNK_SIZE) {
+                        const d = new Float32Array(audioBuffer.slice(0, CHUNK_SIZE));
+                        audioBuffer = audioBuffer.slice(CHUNK_SIZE);
+                        
+                        updateViz(d);
+                        const p = new Int16Array(d.length);
+                        for (let i = 0; i < d.length; i++) p[i] = Math.max(-32768, Math.min(32767, d[i] * 32768));
+                        ws.send(p.buffer);
+                    }
                 };
-                src.connect(proc);
-                proc.connect(aCtx.destination);
+
+                src.connect(node);
+                node.connect(aCtx.destination); // Keep alive
+                proc = node;
 
                 if (!ws || ws.readyState !== 1) {
                     await startWebSocketOnly();
@@ -562,12 +688,18 @@ HTML_PAGE = """
                 toggleBtn.classList.add('active'); 
                 statusMsg.textContent = 'Listening'; 
                 viz.classList.add('active');
-            } catch (err) { alert('Microphone access needed.'); }
+            } catch (err) { console.error(err); alert('Microphone access needed.'); }
         }
 
         function stop(clearUI = false) {
             running = false;
-            if (proc) proc.disconnect();
+            // Clear audio buffer
+            audioBuffer = [];
+            
+            if (proc) {
+                 proc.disconnect();
+                 proc.port.onmessage = null; // Remove event listener
+            }
             if (aCtx) aCtx.close();
             if (stream) stream.getTracks().forEach(t => t.stop());
             // WEBSOCKET REMAINS OPEN FOR SESSION PERSISTENCE
@@ -638,7 +770,11 @@ HTML_PAGE = """
             emptyState.style.display = 'none';
             const m = document.createElement('div');
             m.className = `msg ${role == 'user' ? 'user' : 'bot'}`;
-            m.textContent = text;
+            if (role === 'bot') {
+                m.innerHTML = marked.parse(text);
+            } else {
+                m.textContent = text;
+            }
             chatArea.appendChild(m);
             chatArea.scrollTop = chatArea.scrollHeight;
             return m;
@@ -647,12 +783,12 @@ HTML_PAGE = """
         function showTyping(text) {
             if (!typingMsg) typingMsg = addMsg('bot', '');
             typingMsg.classList.add('typing');
-            typingMsg.textContent = text;
+            typingMsg.innerHTML = marked.parse(text);
             chatArea.scrollTop = chatArea.scrollHeight;
         }
 
         function doneTyping(text) {
-            if (typingMsg) { typingMsg.classList.remove('typing'); typingMsg.textContent = text; typingMsg = null; }
+            if (typingMsg) { typingMsg.classList.remove('typing'); typingMsg.innerHTML = marked.parse(text); typingMsg = null; }
             else if (text) { addMsg('bot', text); }
             chatArea.scrollTop = chatArea.scrollHeight;
         }
@@ -668,6 +804,11 @@ HTML_PAGE = """
 
         function resetViz() { bars.forEach(b => b.style.height = '3px'); }
         function clearChat() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: 'clear'})); stop(true); }
+
+        window.addEventListener('DOMContentLoaded', () => {
+             // Auto-connect on load
+             startWebSocketOnly();
+        });
     </script>
 </body>
 </html>
@@ -686,7 +827,34 @@ async def ws_chat(websocket: WebSocket):
     # Session-specific state
     dg_client = DeepgramClient()
     session_agent = SimpleAgent(use_rag=True)
+
     session_history: List[dict] = []
+    
+    # Generate Session ID
+    session_id = str(uuid.uuid4())
+    # Stash session_id in the first history item as metadata (hidden) or just keep track
+    # We'll put it in a metadata dict in the first item if we want to retrieve it later easily
+    # or just use scope. But passing it to functions is cleaner.
+    # For now, let's just append a metadata item that won't be rendered
+    session_history.append({"session_id": session_id, "role": "system", "content": "Session Init"})
+
+    
+    # Send welcome message
+    welcome_text = "Hi, I am Aura from BharatLogic. How can I help you today?"
+    try:
+        await websocket.send_json({"type": "typing", "content": welcome_text})
+        # Update agent history
+        from langchain_core.messages import AIMessage
+        session_agent.history.append(AIMessage(content=welcome_text))
+        session_history.append({"role": "assistant", "content": welcome_text})
+        
+        # Audio for welcome message (disabled as per request)
+        # for audio_chunk in text_to_speech(welcome_text, dg_client):
+        #     await websocket.send_bytes(audio_to_bytes(audio_chunk))
+        
+        await websocket.send_json({"type": "assistant_message", "content": welcome_text})
+    except Exception as e:
+        logger.error(f"Error sending welcome message: {e}")
     
     try:
         await websocket.send_json({"type": "listening"})
@@ -761,29 +929,43 @@ async def ws_chat(websocket: WebSocket):
         logger.info("Session state cleared")
 
 async def handle_inference(websocket: WebSocket, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, func, *args):
-    """Handles the async-sync inference pipeline."""
+    """Handles the async-sync inference pipeline with comprehensive error handling."""
     stop_flag = threading.Event()
     try:
         await websocket.send_json({"type": "processing"})
         typing_count = 0
         async for event_type, content in run_sync_gen_in_thread(func, *args, session_agent, session_history, dg_client, stop_flag=stop_flag):
-            if event_type == "chat_user": await websocket.send_json({"type": "user_message", "content": content})
-            elif event_type == "typing": 
-                typing_count += 1
-                await websocket.send_json({"type": "typing", "content": content})
-            elif event_type == "clear": await websocket.send_json({"type": "clear"})
-            elif event_type == "shutdown": await websocket.send_json({"type": "shutdown"})
-            elif event_type == "audio":
-                sr, arr = content
-                await websocket.send_bytes(audio_to_bytes((sr, arr)))
-            elif event_type == "chat_assistant": 
-                logger.info(f"Final response sent. Typing events emitted: {typing_count}")
-                await websocket.send_json({"type": "assistant_message", "content": content})
-            elif event_type == "error": await websocket.send_json({"type": "error", "message": content})
+            try:
+                if event_type == "chat_user": 
+                    await websocket.send_json({"type": "user_message", "content": content})
+                elif event_type == "typing": 
+                    typing_count += 1
+                    await websocket.send_json({"type": "typing", "content": content})
+                elif event_type == "clear": 
+                    await websocket.send_json({"type": "clear"})
+                elif event_type == "shutdown": 
+                    await websocket.send_json({"type": "shutdown"})
+                elif event_type == "audio":
+                    sr, arr = content
+                    await websocket.send_bytes(audio_to_bytes((sr, arr)))
+                elif event_type == "chat_assistant": 
+                    logger.info(f"Final response sent. Typing events emitted: {typing_count}")
+                    await websocket.send_json({"type": "assistant_message", "content": content})
+                elif event_type == "error": 
+                    await websocket.send_json({"type": "error", "message": content})
+            except Exception as send_error:
+                logger.error(f"Error sending {event_type}: {send_error}")
+                # If we can't send, the connection is likely broken, so break the loop
+                break
     except asyncio.CancelledError: 
         logger.info("Response task cancelled, signalling background thread")
         stop_flag.set()
-    except Exception as e: logger.error(f"Inference pipeline failure: {e}")
+    except Exception as e: 
+        logger.error(f"Inference pipeline failure: {e}")
+        try:
+            await websocket.send_json({"type": "error", "message": "An error occurred processing your request."})
+        except:
+            pass  # Connection already closed
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
