@@ -316,20 +316,34 @@ class SimpleAgent:
     def generate_summary(self) -> dict:
         """Generates a structured summary of the conversation as JSON."""
         try:
-            summary_prompt = (
-                "Analyze the conversation history and extract the following information:\n"
-                "1. User's name (if mentioned)\n"
-                "2. User's phone number (if provided)\n"
-                "3. User's email (if provided)\n"
-                "4. A concise summary paragraph including: user's main intent, key information provided, "
-                "any scheduled meetings or next steps.\n"
-                "Extract exactly what was shared - do not invent or assume information."
-            )
-            
+            summary_prompt = """STRICT EXTRACTION RULES - READ CAREFULLY:
+
+    You are analyzing a conversation transcript. Extract ONLY information that was EXPLICITLY stated by the user.
+
+    CRITICAL RULES:
+    1. **name**: Extract ONLY if the user literally said "My name is X" or "I'm X" or "This is X". If no explicit name was given by the user, return null.
+    2. **phone**: Extract ONLY if the user provided a phone number in digits. If no phone number was shared by the user, return null.
+    3. **email**: Extract ONLY if the user typed/said an email address with @ symbol. If no email was shared by the user, return null.
+    4. **summary**: Summarize ONLY what was actually discussed including: user's main intent, key information provided, any scheduled meetings or next steps. Do NOT assume or infer anything.
+
+    FORBIDDEN:
+    - Do NOT guess or infer names from context
+    - Do NOT assume contact details were shared if they weren't
+    - Do NOT make up any information
+    - Do NOT include information the assistant said, only what the USER said
+    - Do NOT include include Bharatlogic's contact details in the place of user's contact details
+    - Do NOT include include Bharatlogic's email in the place of user's email
+    
+    If in doubt, return null for that field.
+
+    Now analyze the conversation and extract information following these strict rules."""
+
             messages = self.history + [HumanMessage(content=summary_prompt)]
             structured_model = self.model.with_structured_output(ChatDetails)
             response = structured_model.invoke(messages)
-            print(f"Summary: {response}")
+            
+            # Double-check: if summary mentions "name" but name field is None, that's correct
+            logger.info(f"Summary: {response}")
             return response.model_dump()
         except Exception as e:
             logger.error(f"Error generating summary: {e}")
