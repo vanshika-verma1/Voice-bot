@@ -1,19 +1,21 @@
 import io
 from dotenv import load_dotenv
 load_dotenv()
-
+import queue
+import time
 import wave
 import asyncio
 import threading
 import numpy as np
-from typing import Generator, Tuple, List, Optional
+from typing import Generator, AsyncGenerator, Tuple, List, Optional
 from collections import deque
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from deepgram import DeepgramClient
+from fastapi.middleware.cors import CORSMiddleware
+from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions, SpeakOptions, SpeakWSOptions, SpeakWebSocketEvents
 from loguru import logger
 import uvicorn
 import uuid
@@ -24,7 +26,6 @@ import os
 from pysilero_vad import SileroVoiceActivityDetector
 from agent import SimpleAgent
 
-# Logging configuration
 logger.remove()
 logger.add(
     lambda msg: print(msg),
@@ -32,28 +33,47 @@ logger.add(
     format="<green>{time:HH:mm:ss}</green> | <level>{level}</level> | <level>{message}</level>",
 )
 
-
-# DeepgramClient will be instantiated per session inside ws_chat
-
-# MongoDB Setup
 MONGO_URI = os.getenv("MONGO_URI")
 mongo_client = MongoClient(MONGO_URI)
 db = mongo_client["voice_bot_db"]
 conversations_collection = db["conversations"]
+chat_logs_collection = db["chat_logs"]
 
-def save_conversation_summary(session_id: str, summary: str, user_data: dict):
-    """Saves the conversation summary to MongoDB."""
+def save_conversation_summary(session_id: str, summary_data: dict, chat_history: List[dict]):
+    """Saves the conversation summary and full chat logs to MongoDB.
+    Only saves if name AND (phone OR email) are present."""
     try:
-        document = {
+        name = summary_data.get("name")
+        phone = summary_data.get("phone")
+        email = summary_data.get("email")
+        
+        # Skip save if name is missing or no contact info (Commented out to save all chats)
+        # if not name or (not phone and not email):
+        #     logger.info(f"Skipping save for session {session_id}: missing name or contact info")
+        #     return
+        
+        # 1. Save Summary
+        summary_doc = {
             "session_id": session_id,
             "timestamp": datetime.utcnow(),
-            "summary": summary,
-            "user_data": user_data
+            "name": name,
+            "phone": phone,
+            "email": email,
+            "summary": summary_data.get("summary", "")
         }
-        conversations_collection.insert_one(document)
-        logger.info(f"Summary saved for session {session_id}")
+        conversations_collection.insert_one(summary_doc)
+        
+        # 2. Save Full Chat Logs
+        chat_log_doc = {
+            "session_id": session_id,
+            "timestamp": datetime.utcnow(),
+            "chat_history": chat_history
+        }
+        chat_logs_collection.insert_one(chat_log_doc)
+        
+        logger.info(f"Summary and Full Chat Logs saved for session {session_id}")
     except Exception as e:
-        logger.error(f"Failed to save summary: {e}")
+        logger.error(f"Failed to save conversation data: {e}")
 
 
 def audio_to_bytes(audio: Tuple[int, np.ndarray]) -> bytes:
@@ -65,7 +85,6 @@ def audio_to_bytes(audio: Tuple[int, np.ndarray]) -> bytes:
         else:
             audio_data = audio_data.astype(np.int16)
     
-    # Flatten if stereo/2D
     if len(audio_data.shape) > 1:
         audio_data = audio_data.flatten()
     
@@ -106,7 +125,6 @@ class SileroVADWrapper:
             
             if is_speech:
                 if not self.is_speaking:
-                    # Start speaking: include pre-roll for better STT context
                     self.speech_buffer = list(self.pre_roll)
                     events.append(("start_speech", None))
                 self.is_speaking = True
@@ -117,7 +135,6 @@ class SileroVADWrapper:
                     self.speech_buffer.append(chunk)
                     self.silence_counter += 1
                     if self.silence_counter >= self.max_silence_chunks:
-                        # Speech finished - check if it's long enough to be real
                         complete_audio = np.concatenate(self.speech_buffer)
                         self.speech_buffer = []
                         self.is_speaking = False
@@ -131,24 +148,173 @@ class SileroVADWrapper:
                     self.pre_roll.append(chunk)
         return events
 
-# ==================== AUDIO PROCESSING ====================
+class DeepgramTTSManager:
+    """Manages TTS with persistent connection - sequential processing."""
+    
+    def __init__(self, dg_client: DeepgramClient):
+        self.dg_client = dg_client
+        self._cancelled = False
+        self._connection = None
+        self._audio_queue = None
+        self._is_connected = False
+        self._lock = threading.Lock()
+        self._speak_lock = threading.Lock()  # Ensures one speak at a time
+        
+    def connect(self):
+        """Establish persistent TTS connection."""
+        if self._is_connected:
+            return True
+            
+        with self._lock:
+            if self._is_connected:
+                return True
+                
+            try:
+                self._audio_queue = queue.Queue()
+                self._connection = self.dg_client.speak.websocket.v("1")
+                
+                audio_q = self._audio_queue
+                
+                def on_binary_data(self_dg, data, **kwargs):
+                    audio_q.put(("audio", data))
+                
+                def on_close(self_dg, close, **kwargs):
+                    logger.debug("TTS: Connection closed by server")
+                    audio_q.put(("close", None))
+                
+                self._connection.on(SpeakWebSocketEvents.AudioData, on_binary_data)
+                self._connection.on(SpeakWebSocketEvents.Close, on_close)
+                
+                options = SpeakWSOptions(
+                    model="aura-2-andromeda-en",
+                    encoding="linear16",
+                    sample_rate=16000,
+                )
+                
+                if self._connection.start(options):
+                    self._is_connected = True
+                    logger.info("TTS: Persistent connection established")
+                    return True
+                else:
+                    logger.error("TTS: Failed to start connection")
+                    return False
+            except Exception as e:
+                logger.error(f"TTS connection error: {e}")
+                return False
+    
+    def speak_sync(self, text: str) -> bytes:
+        """Send text and return audio bytes - SEQUENTIAL, one at a time."""
+        if not text.strip():
+            return b''
+        
+        # Lock ensures only one speak() runs at a time
+        with self._speak_lock:
+            if self._cancelled:
+                self._cancelled = False
+                return b''
+            
+            if not self._is_connected:
+                if not self.connect():
+                    return b''
+            
+            # Clear any old audio in queue
+            while not self._audio_queue.empty():
+                try:
+                    self._audio_queue.get_nowait()
+                except:
+                    break
+            
+            logger.debug(f"TTS: Sending text: '{text[:40]}...'")
+            
+            try:
+                self._connection.send_text(text)
+                self._connection.flush()
+            except Exception as e:
+                logger.error(f"TTS send error: {e}")
+                self._is_connected = False
+                # Retry with new connection
+                if self.connect():
+                    try:
+                        self._connection.send_text(text)
+                        self._connection.flush()
+                    except:
+                        return b''
+                else:
+                    return b''
+            
+            start_time = time.time()
+            last_audio_time = start_time
+            started_receiving = False
+            accumulated_bytes = bytearray()
+            
+            while True:
+                if self._cancelled:
+                    logger.debug("TTS cancelled")
+                    self._cancelled = False
+                    return b''
+                
+                try:
+                    msg_type, data = self._audio_queue.get(timeout=0.1)
+                    if msg_type == "audio":
+                        started_receiving = True
+                        last_audio_time = time.time()
+                        accumulated_bytes.extend(data)
+                    elif msg_type == "close":
+                        self._is_connected = False
+                        break
+                except queue.Empty:
+                    now = time.time()
+                    # Wait for complete audio (0.5s silence = done)
+                    if started_receiving and (now - last_audio_time > 0.5):
+                        break
+                    if not started_receiving and (now - start_time > 5.0):
+                        logger.warning("TTS: No audio received, timeout")
+                        return b''
+            
+            logger.debug(f"TTS: Received {len(accumulated_bytes)} bytes")
+            return bytes(accumulated_bytes)
+    
+    def speak(self, text: str):
+        """Generator wrapper for speak_sync."""
+        audio_bytes = self.speak_sync(text)
+        if audio_bytes:
+            try:
+                audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+                yield (16000, audio_array.reshape(1, -1))
+            except Exception as e:
+                logger.error(f"TTS audio error: {e}")
+    
+    def cancel(self):
+        """Cancel current TTS."""
+        self._cancelled = True
+        if self._audio_queue:
+            while not self._audio_queue.empty():
+                try:
+                    self._audio_queue.get_nowait()
+                except:
+                    break
+    
+    def close(self):
+        """Close persistent connection."""
+        self._cancelled = True
+        with self._lock:
+            if self._connection and self._is_connected:
+                try:
+                    self._connection.finish()
+                except:
+                    pass
+                self._is_connected = False
+        logger.info("TTS Manager closed")
 
 def clean_text_for_tts(text: str) -> str:
     """Removes Markdown characters and extra punctuation for cleaner speech."""
     import re
-    # Remove bold/italic (**, *, __, _)
     text = re.sub(r'(\*\*|\*|__|_)', '', text)
-    # Remove headers (#)
     text = re.sub(r'#+\s*', '', text)
-    # Remove list markers at start of lines (-, +, *, 1., 2.)
     text = re.sub(r'^\s*([-+*]|\d+\.)\s+', '', text, flags=re.MULTILINE)
-    # Remove links [text](url) -> text
     text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
-    # Remove code blocks and backticks
     text = re.sub(r'(`|```[a-z]*\n|```)', '', text)
-    # Replace newlines with spaces
     text = text.replace('\n', ' ')
-    # Normalize spaces
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -156,7 +322,6 @@ def transcribe_audio(audio: Tuple[int, np.ndarray], dg_client: DeepgramClient) -
     """Transcribe audio using Deepgram Nova-3 REST API."""
     audio_bytes = audio_to_bytes(audio)
     
-    # Validation: Skip if audio is empty (44 bytes is just the WAV header)
     if len(audio_bytes) <= 25:
         return ""
         
@@ -174,52 +339,162 @@ def transcribe_audio(audio: Tuple[int, np.ndarray], dg_client: DeepgramClient) -
         return ""
 
 def text_to_speech(text: str, dg_client: DeepgramClient) -> Generator[Tuple[int, np.ndarray], None, None]:
-    """Convert text to speech using Deepgram Aura TTS."""
+    """Convert text to speech using Deepgram Aura TTS WebSocket API for streaming."""
     if not text.strip():
         return
-    try:
-        response = dg_client.speak.v1.audio.generate(
-            text=text,
-            model="aura-2-arcas-en",
-            encoding="linear16",
-            sample_rate=24000
-        )
-        audio_bytes = b''.join(response)
-        if not audio_bytes:
-            return
-        audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
-        
-        # Fade to prevent clicks (50ms fade)
-        fade_samples = min(1200, len(audio_array) // 6)
-        if fade_samples > 0:
-            audio_array[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples)
-            audio_array[-fade_samples:] *= np.linspace(1.0, 0.0, fade_samples)
-            
-        audio_array = audio_array.astype(np.int16).reshape(1, -1)
-        yield (24000, audio_array)
-    except Exception as e:
-        logger.error(f"TTS Error: {e}")
 
-def process_chat_common(text: str, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, suppress_tts: bool = False) -> Generator:
-    """Shared pipeline: Agent -> per-sentence TTS (if not suppressed)."""
-    
+    logger.info(f"TTS Start: '{text[:30]}...'")
+    import queue
+    audio_queue = queue.Queue()
 
-    # Check for explicit 'clear' command (no AI response needed)
-    clean_text = text.lower().strip().strip('.').strip('!').strip('?')
-    
-    if clean_text in ["clear history", "clear"]:
-        logger.info("Manual clear triggered")
-        
-        # correct: generate and save summary before clearing
+    async def run_ws_tts():
         try:
-             # Generate summary
-            summary = session_agent.generate_summary()
+            # Create a live connection
+            dg_connection = dg_client.speak.websocket.v("1")
+            import time
+            last_audio_time = [None] # Use list for mutable closure access or use nonlocal
+
+            def on_binary_data(self, data, **kwargs):
+                # logger.debug(f"TTS WS: Received {len(data)} bytes")
+                audio_queue.put(data)
+                last_audio_time[0] = time.time()
+
+            # Wait for the stream to close
+            close_event = asyncio.Event()
             
-            # Save to DB
-            session_id = session_history[0].get("session_id") if session_history and "session_id" in session_history[0] else str(uuid.uuid4())
-            save_conversation_summary(session_id, summary, session_agent.user_data)
+            def on_close(self, close, **kwargs):
+                logger.debug("TTS WS: Connection closed by server")
+                close_event.set()
+
+            dg_connection.on(SpeakWebSocketEvents.AudioData, on_binary_data)
+            dg_connection.on(SpeakWebSocketEvents.Close, on_close)
+            
+            options = SpeakWSOptions(
+                model="aura-2-andromeda-en",
+                encoding="linear16",
+                sample_rate=16000,
+            )
+            
+            if dg_connection.start(options) is False:
+                logger.error("Failed to start Deepgram TTS WS")
+                audio_queue.put(None)
+                return
+
+            logger.debug(f"TTS WS: Sending text: '{text[:30]}...'")
+            dg_connection.send_text(text)
+            dg_connection.flush()
+            
+            # Idle timeout logic (mimicking Twilio example)
+            # Wait for audio to start, then wait for it to stop (silence gap)
+            start_wait = time.time()
+            IDLE_TIMEOUT = 0.5  # 500ms silence = done
+            MAX_WAIT = 10.0     # Max time to wait for ANYTHING
+            
+            while True:
+                await asyncio.sleep(0.05)
+                now = time.time()
+                
+                # Check for explicit close
+                if close_event.is_set():
+                    logger.debug("TTS WS: Closed event received early")
+                    break
+
+                # If we have received audio, check for idle silence
+                if last_audio_time[0] is not None:
+                    if (now - last_audio_time[0]) >= IDLE_TIMEOUT:
+                        logger.debug("TTS WS: Idle timeout reached, assuming complete")
+                        break
+                
+                # If we haven't received ANY audio yet, check global timeout
+                elif (now - start_wait) >= MAX_WAIT:
+                    logger.warning("TTS WS: Max wait reached without completion")
+                    break
+
+            # Cleanup
+            dg_connection.finish()
+            audio_queue.put(None)
+
         except Exception as e:
-            logger.error(f"Error saving summary on clear: {e}")
+            logger.error(f"TTS WS Error: {e}")
+            audio_queue.put(None)
+
+    # Run async TTS in a separate thread to yield chunks as they arrive
+    tts_thread = threading.Thread(target=lambda: asyncio.run(run_ws_tts()))
+    tts_thread.start()
+
+    accumulated_bytes = bytearray()
+    
+    # Threshold for buffering (e.g., 0.25 seconds of 16kHz mono 16-bit audio = 8000 bytes)
+    # Reduces overhead of WAV headers and browser decoding calls
+    BUFFER_THRESHOLD = 3200
+
+    while True:
+        chunk = audio_queue.get()
+        if chunk is None:
+            # End of stream: yield remaining buffer if any
+            if accumulated_bytes:
+                try:
+                    logger.debug(f"TTS: Yielding final buffer {len(accumulated_bytes)} bytes")
+                    audio_array = np.frombuffer(accumulated_bytes, dtype=np.int16).astype(np.float32)
+                    audio_array = np.clip(audio_array, -32767.0, 32767.0)
+                    out_array = audio_array.astype(np.int16).reshape(1, -1)
+                    yield (16000, out_array)
+                except Exception as e:
+                    logger.error(f"Error processing final TTS chunk: {e}")
+            break
+        
+        accumulated_bytes.extend(chunk)
+
+        if len(accumulated_bytes) >= BUFFER_THRESHOLD:
+            # We now prefer to wait for the whole sentence to ensure smoothness
+            # preventing "choppy" playback within a sentence.
+            # But if it gets TOO big (e.g. > 3 seconds), we yield to prevent massive latency.
+            if len(accumulated_bytes) > 96000: # ~3 seconds
+                 try:
+                    logger.debug(f"TTS: Yielding large buffer {len(accumulated_bytes)} bytes")
+                    audio_array = np.frombuffer(accumulated_bytes, dtype=np.int16).astype(np.float32)
+                    audio_array = np.clip(audio_array, -32767.0, 32767.0)
+                    out_array = audio_array.astype(np.int16).reshape(1, -1)
+                    yield (16000, out_array)
+                    accumulated_bytes = bytearray()
+                 except Exception as e:
+                    logger.error(f"Error processing TTS chunk: {e}")
+                    accumulated_bytes = bytearray()
+
+    tts_thread.join()
+
+# def process_chat_common(text: str, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, executor, stop_flag: threading.Event = None, suppress_tts: bool = False) -> Generator:
+def process_chat_common(text: str, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, executor, tts_manager: DeepgramTTSManager = None, stop_flag: threading.Event = None, suppress_tts: bool = False) -> Generator:
+    """Shared pipeline: Agent -> parallel per-sentence TTS with word-count fallback."""
+    
+    clean_text = text.lower().strip().strip('.').strip('!').strip('?')
+    end_phrases = ["goodbye", "bye", "have a great day", "take care"]
+    
+    # 1. Immediate End Check
+    if any(p == clean_text or clean_text.startswith(p + " ") or clean_text.endswith(" " + p) for p in end_phrases):
+        logger.info(f"Immediate end phrase detected: {clean_text}")
+        try:
+            if len(session_agent.history) > 1:
+                summary = session_agent.generate_summary()
+                session_id = session_history[0].get("session_id") if session_history and "session_id" in session_history[0] else str(uuid.uuid4())
+                save_conversation_summary(session_id, summary, session_history)
+        except Exception as e:
+            logger.error(f"Error saving summary on immediate goodbye: {e}")
+
+        session_history.clear()
+        session_agent.clear_history()
+        yield ("shutdown", None)
+        return
+
+    if clean_text in ["clear history", "clear"]:
+        logger.info("Manual text-chat clear triggered")
+        try:
+            if len(session_agent.history) > 1:
+                summary = session_agent.generate_summary()
+                session_id = session_history[0].get("session_id") if session_history and "session_id" in session_history[0] else str(uuid.uuid4())
+                save_conversation_summary(session_id, summary, session_history)
+        except Exception as e:
+            logger.error(f"Error saving summary on text clear: {e}")
 
         session_history.clear()
         session_agent.clear_history()
@@ -227,90 +502,191 @@ def process_chat_common(text: str, session_agent: SimpleAgent, session_history: 
         return
 
     session_history.append({"role": "user", "content": text})
-
-    # LLM & TTS
     full_response = ""
-    current_chunk = ""
-    first_chunk_sent = False
+    buffer = ""
     
-    # Punctuations that trigger TTS. 
-    # For the first chunk, we include mid-sentence punctuation for speed.
-    first_chunk_endings = {'.', '!', '?', ',', ';', ':', '।', '。', '\n'}
-    sentence_endings = {'.', '!', '?', '।', '。', '\n'}
+    # Queue management for parallel streaming
+    # We use a deque of Queues to maintain sentence order:
+    # [Queue(Sentence1), Queue(Sentence2), ...]
+    from collections import deque
+    import queue
+    import concurrent.futures
+    
+    audio_queues = deque() 
+    
+    # def tts_stream_feeder(text_input, output_q):
+    #     """Feeds audio chunks from generator to a queue."""
+    #     try:
+    #         clean_txt = clean_text_for_tts(text_input)
+    #         if clean_txt:
+    #             for chunk in text_to_speech(clean_txt, dg_client):
+    #                 output_q.put(("audio", chunk))
+    #     except Exception as e:
+    #         logger.error(f"TTS Stream Error: {e}")
+    #     finally:
+    #         output_q.put(("done", None))
+    def tts_stream_feeder(text_input, output_q):
+        """Feeds audio chunks from generator to a queue - uses sync method for parallel processing."""
+        try:
+            clean_txt = clean_text_for_tts(text_input)
+            if clean_txt and tts_manager:
+                # Get audio bytes directly (non-blocking for queue)
+                audio_bytes = tts_manager.speak_sync(clean_txt)
+                if audio_bytes:
+                    try:
+                        audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+                        output_q.put(("audio", (16000, audio_array.reshape(1, -1))))
+                    except Exception as e:
+                        logger.error(f"TTS audio conversion error: {e}")
+        except Exception as e:
+            logger.error(f"TTS Stream Error: {e}")
+        finally:
+            output_q.put(("done", None))
+
+    def poll_audio_queues():
+        """Helper to drain ready audio chunks from the active queue."""
+        chunks = []
+        # While we have active queues
+        while audio_queues:
+            current_q = audio_queues[0] # Look at the first one (in order)
+            try:
+                while True:
+                    # Non-blocking get
+                    item_type, item_data = current_q.get_nowait()
+                    if item_type == "audio":
+                        chunks.append(item_data)
+                    elif item_type == "done":
+                        # This sentence is fully consumed
+                        audio_queues.popleft()
+                        break # Break inner loop, check next queue in outer loop
+            except queue.Empty:
+                # Current queue has no more data right now, but isn't done
+                break 
+        return chunks
+
+    is_first_chunk = True
     
     try:
+        executor_stream = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+        
         for event in session_agent.stream(
             {"messages": [{"role": "user", "content": text}]}, 
             stream_mode="messages"
         ):
             message, _ = event
             if hasattr(message, 'content') and message.content:
-                current_chunk += message.content
-                full_response += message.content
-                yield ("typing", full_response)
+                chunk_text = message.content
+                full_response += chunk_text
+                buffer += chunk_text
                 
-                # Determine if we should trigger TTS
-                if not suppress_tts:
-                    trigger = False
-                    if not first_chunk_sent:
-                        word_count = len(current_chunk.strip().split())
-                        # Increased threshold to 8 words for smoother first chunk
-                        if any(current_chunk.rstrip().endswith(e) for e in first_chunk_endings) or word_count >= 8:
-                            trigger = True
+                # Yield regular typing update
+                # yield ("typing", chunk_text) # Optional: if needed by UI
+                
+                # Check for punctuation to splice sentences
+                # Check for punctuation OR word count to splice sentences
+                words_in_buffer = len(buffer.split())
+                has_sentence_end = any(p in buffer for p in [".", "?", "!"])
+                has_pause_punct = "," in buffer and words_in_buffer >= 8
+                should_force_split = words_in_buffer >= 15  # Force split at 15 words
+
+                if has_sentence_end or has_pause_punct or should_force_split:
+                    import re
+                    
+                    if has_sentence_end:
+                        # Split by sentence-ending punctuation
+                        parts = re.split(r'([.?!])\s*', buffer)
+                    elif has_pause_punct:
+                        # Split by comma for natural pause
+                        parts = re.split(r'(,)\s*', buffer)
                     else:
-                        if any(current_chunk.rstrip().endswith(e) for e in sentence_endings):
-                            trigger = True
+                        # Force split at word boundary (take first 12 words)
+                        words = buffer.split()
+                        first_part = ' '.join(words[:12])
+                        remainder = ' '.join(words[12:])
+                        parts = [first_part, '', remainder] if remainder else [first_part, '']
+                    
+                    if len(parts) > 1:
+                        # parts like: ["Hello", ".", " How are you", "?", ""]
+                        processed_buffer = ""
+                        
+                        idx = 0
+                        while idx < len(parts) - 1:
+                            sentence = parts[idx] + (parts[idx+1] if idx+1 < len(parts) else "")
+                            idx += 2
+                            
+                            if sentence.strip() and len(sentence.strip()) > 2:
+                                is_first_chunk = False
+                                # Start streaming TTS for this sentence
+                                q = queue.Queue()
+                                audio_queues.append(q)
+                                executor_stream.submit(tts_stream_feeder, sentence, q)
+                            
+                            processed_buffer += sentence
+                        
+                        # Any remainder goes back to buffer
+                        if idx < len(parts):
+                            buffer = parts[idx]
+                        else:
+                            buffer = ""
 
-                    if trigger and len(current_chunk.strip()) > 2:
-                        clean_text = clean_text_for_tts(current_chunk.strip())
-                        if clean_text:
-                            logger.info(f'TTS Trigger ({"Fast" if not first_chunk_sent else "Sentence"}): "{clean_text}"')
-                            for audio_chunk in text_to_speech(clean_text, dg_client):
-                                yield ("audio", audio_chunk)
-                        current_chunk = ""
-                        first_chunk_sent = True
+            # INTERLEAVED POLLING: Check for audio while LLM generates
+            ready_chunks = poll_audio_queues()
+            for ac in ready_chunks:
+                yield ("audio", ac)
+                
+            if stop_flag and stop_flag.is_set():
+                break
         
-        if not suppress_tts and current_chunk.strip():
-            clean_text = clean_text_for_tts(current_chunk.strip())
-            if clean_text:
-                logger.info(f'TTS Trigger (final): "{clean_text}"')
-                for audio_chunk in text_to_speech(clean_text, dg_client):
-                    yield ("audio", audio_chunk)
+        # Final buffer processing
+        if buffer.strip():
+            if not suppress_tts:
+                q = queue.Queue()
+                audio_queues.append(q)
+                executor_stream.submit(tts_stream_feeder, buffer.strip(), q)
         
-        session_history.append({"role": "assistant", "content": full_response})
-        yield ("chat_assistant", full_response)
-        
-        # Check if session should end (User or AI said goodbye)
-        user_clean = text.lower()
-        ai_clean = full_response.lower()
-        end_phrases = ["goodbye", "bye", "end call", "thank you goodbye", "thanks bye", "have a good day", "have a great day"]
-        
-
-        if any(p in user_clean for p in end_phrases) or any(p in ai_clean for p in end_phrases):
-            logger.info("End phrase detected. Shutting down after playback.")
+        # Drain remaining audio
+        while audio_queues:
+            if stop_flag and stop_flag.is_set(): 
+                logger.info("Parallel TTS processing halted due to interruption")
+                break
             
-            # Generate and save summary
-            try:
-                summary = session_agent.generate_summary()
-                # We need to access session_id, which we'll stash in history or pass in. 
-                # For now, let's grab it if we put it in history, otherwise generate new (not ideal but safe)
-                session_id = session_history[0].get("session_id") if session_history and "session_id" in session_history[0] else str(uuid.uuid4())
-                save_conversation_summary(session_id, summary, session_agent.user_data)
-            except Exception as e:
-                logger.error(f"Error saving summary on shutdown: {e}")
-
-            session_history.clear()
-            session_agent.clear_history()
-            yield ("shutdown", None)
-            return 
+            ready_chunks = poll_audio_queues()
+            for ac in ready_chunks:
+                yield ("audio", ac)
             
-        logger.debug("Task finished successfully")
-        
+            # Since we're done generating text, we can afford a small sleep to prevent busy loop 
+            # while waiting for final audio
+            if audio_queues:
+                import time
+                time.sleep(0.05)
+
+        executor_stream.shutdown(wait=False)
+
     except Exception as e:
-        logger.error(f"Inference Error: {e}")
+        logger.error(f"Inference Loop Error: {e}")
         yield ("error", str(e))
 
-def process_audio_sync(audio: Tuple[int, np.ndarray], session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient) -> Generator:
+    session_history.append({"role": "assistant", "content": full_response})
+    yield ("chat_assistant", full_response)
+
+    # 2. End-of-response Goodbye Check (if not already handled)
+    ai_clean = full_response.lower()
+    if any(p in ai_clean for p in end_phrases):
+        logger.info("End phrase detected in AI response.")
+        try:
+            if len(session_agent.history) > 1:
+                summary = session_agent.generate_summary()
+                session_id = session_history[0].get("session_id") if session_history and "session_id" in session_history[0] else str(uuid.uuid4())
+                save_conversation_summary(session_id, summary, session_history)
+        except Exception as e:
+            logger.error(f"Error saving summary on AI goodbye: {e}")
+
+        session_history.clear()
+        session_agent.clear_history()
+        yield ("shutdown", None)
+
+# def process_audio_sync(audio: Tuple[int, np.ndarray], session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, executor, stop_flag: threading.Event = None) -> Generator:
+def process_audio_sync(audio: Tuple[int, np.ndarray], session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, executor, tts_manager: DeepgramTTSManager = None, stop_flag: threading.Event = None) -> Generator:
     """Voice pipeline: STT -> Shared Logic with TTS."""
     transcript = transcribe_audio(audio, dg_client)
     if not transcript.strip():
@@ -318,46 +694,62 @@ def process_audio_sync(audio: Tuple[int, np.ndarray], session_agent: SimpleAgent
     logger.info(f'Transcribed: "{transcript}"')
     
     yield ("chat_user", transcript)
-    yield from process_chat_common(transcript, session_agent, session_history, dg_client, suppress_tts=False)
+    # yield from process_chat_common(transcript, session_agent, session_history, dg_client, executor, stop_flag=stop_flag, suppress_tts=False)
+    yield from process_chat_common(transcript, session_agent, session_history, dg_client, executor, tts_manager=tts_manager, stop_flag=stop_flag, suppress_tts=False)
 
-def process_text_chat(text: str, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient) -> Generator:
+# def process_text_chat(text: str, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, executor, stop_flag: threading.Event = None) -> Generator:
+def process_text_chat(text: str, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, executor, tts_manager: DeepgramTTSManager = None, stop_flag: threading.Event = None) -> Generator:   
     """Text pipeline: Shared Logic without TTS."""
-    yield from process_chat_common(text, session_agent, session_history, dg_client, suppress_tts=True)
-
-async def run_sync_gen_in_thread(gen_func, *args, stop_flag: threading.Event = None):
-    """Bridge sync generator to async iterator with cancellation."""
+    # yield from process_chat_common(text, session_agent, session_history, dg_client, executor, stop_flag=stop_flag, suppress_tts=True)
+    yield from process_chat_common(text, session_agent, session_history, dg_client, executor, tts_manager=tts_manager, stop_flag=stop_flag, suppress_tts=True)
+async def run_sync_gen_in_thread(gen_func, *args, stop_flag: threading.Event = None, **kwargs):
+    """Bridge sync generator to async iterator with cancellation support."""
     q = asyncio.Queue()
     loop = asyncio.get_event_loop()
-    def producer():
+
+    def worker():
         try:
-            for item in gen_func(*args):
+            for item in gen_func(*args, **kwargs, stop_flag=stop_flag):
                 if stop_flag and stop_flag.is_set():
-                    logger.info("Background thread cancellation detected")
                     break
                 loop.call_soon_threadsafe(q.put_nowait, {"type": "data", "item": item})
             loop.call_soon_threadsafe(q.put_nowait, {"type": "done"})
         except Exception as e:
-            loop.call_soon_threadsafe(q.put_nowait, {"type": "error", "error": e})
+            logger.error(f"Sync generator worker error: {e}")
+            loop.call_soon_threadsafe(q.put_nowait, {"type": "error", "error": str(e)})
     
-    thread = threading.Thread(target=producer, daemon=True)
+    thread = threading.Thread(target=worker, daemon=True)
     thread.start()
     
     while True:
         try:
             msg = await q.get()
-            if msg["type"] == "data": yield msg["item"]
-            elif msg["type"] == "done": break
-            elif msg["type"] == "error": break
+            if msg["type"] == "data": 
+                yield msg["item"]
+            elif msg["type"] == "done": 
+                break
+            elif msg["type"] == "error": 
+                yield ("error", msg["error"])
+                break
         except asyncio.CancelledError:
             if stop_flag: stop_flag.set()
             raise
 
-# ==================== FastAPI & UI ====================
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Lifespan: Pre-loading RAG vector store...")
+    from rag.retriever import get_relevant_context
+    # Run a dummy search to trigger singleton initialization and index loading
+    try:
+        get_relevant_context("initialization warmup")
+    except Exception as e:
+        logger.error(f"Lifespan: RAG warmup failed: {e}")
+        
     logger.info("Aura Voice Agent Active - Port 8000")
     yield
+    logger.info("Shutting down: closing resources...")
+    mongo_client.close()
+    logger.info("MongoDB connection closed.")
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -371,7 +763,7 @@ HTML_PAGE = """
     <title>Voice Agent</title>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: inherit; }
         body { 
             font-family: 'Inter', -apple-system, sans-serif; 
             background: #0a1628; 
@@ -508,6 +900,7 @@ HTML_PAGE = """
             padding: 0.5rem 0.4rem;
             font-size: 0.95rem;
             outline: none;
+            font-family: inherit;
         }
         #textInput::placeholder { color: rgba(255, 255, 255, 0.15); }
 
@@ -531,6 +924,52 @@ HTML_PAGE = """
         .icon-btn.primary:hover { background: #00d8e0; transform: scale(1.05); }
         .icon-btn svg { width: 1.2rem; height: 1.2rem; }
 
+        /* Session Ended Banner (Bottom) */
+        .ended-overlay {
+            background: rgba(10, 22, 40, 0.95);
+            border-top: 1px solid rgba(0, 245, 255, 0.3);
+            display: none;
+            flex-direction: row;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0.8rem 1.2rem;
+            z-index: 100;
+            animation: slideInBottom 0.3s ease-out;
+            position: relative;
+            margin-top: -10px;
+            margin-bottom: 10px;
+            border-radius: 0.75rem;
+            box-shadow: 0 -5px 20px rgba(0, 0, 0, 0.3);
+        }
+        @keyframes slideInBottom { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        
+        .ended-content {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            width: 100%;
+            justify-content: space-between;
+        }
+        .ended-text h2 { color: #00f5ff; font-size: 0.9rem; margin-bottom: 2px; }
+        .ended-text p { color: rgba(255, 255, 255, 0.5); font-size: 0.75rem; }
+        
+        .btn-restart {
+            background: #00f5ff;
+            color: #000;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            font-size: 0.75rem;
+            white-space: nowrap;
+            font-family: inherit;
+        }
+        .btn-restart:hover { transform: translateY(-1px); box-shadow: 0 3px 10px rgba(0, 245, 255, 0.2); }
+
         .btn-clear { background: transparent; color: rgba(255, 255, 255, 0.2); border: none; font-size: 0.65rem; cursor: pointer; text-transform: uppercase; letter-spacing: 0.08em; align-self: center; margin-top: 0.5rem; }
         .placeholder { flex: 1; display: flex; align-items: center; justify-content: center; color: rgba(255, 255, 255, 0.15); font-size: 0.85rem; text-align: center; }
     </style>
@@ -545,6 +984,19 @@ HTML_PAGE = """
         </div>
         
         <div class="footer-controls">
+            <!-- Session Ended Banner -->
+            <div class="ended-overlay" id="endedOverlay">
+                <div class="ended-content">
+                    <div class="ended-text">
+                        <h2>Chat Ended</h2>
+                    </div>
+                    <button class="btn-restart" onclick="resetSession()">Start New Chat</button>
+                </div>
+            </div>
+
+            <div class="hint-row" style="text-align: center; margin-bottom: 0.5rem;">
+                <span style="opacity: 0.6; font-size: 0.75rem; color: #00f5ff;">Please turn on microphone to start voice chat.</span>
+            </div>
             <div class="status-row">
                 <div class="visualizer" id="viz">
                     <div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div><div class="bar"></div>
@@ -553,7 +1005,7 @@ HTML_PAGE = """
                 <div class="status" id="statusMsg">Ready</div>
             </div>
 
-            <div class="input-bar">
+            <div class="input-bar" id="inputBar">
                 <button class="icon-btn" id="toggleBtn" title="Voice Chat">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>
                 </button>
@@ -580,6 +1032,19 @@ HTML_PAGE = """
         let pendingShutdown = false;
         let typingMsg = null;
         let scheduledTime = 0;
+        let sessionEnded = false;
+        let decodeQueue = [];
+        let decoding = false;
+        let tts_cancel = false; 
+
+        // Open all links in new tabs
+        document.addEventListener('click', function(e) {
+            const target = e.target.closest('a');
+            if (target && target.href && (target.href.startsWith('http') || target.href.startsWith('https'))) {
+                target.setAttribute('target', '_blank');
+                target.setAttribute('rel', 'noopener noreferrer');
+            }
+        });
 
         const chatArea = document.getElementById('chatArea');
         const emptyState = document.getElementById('emptyState');
@@ -589,17 +1054,19 @@ HTML_PAGE = """
         const statusMsg = document.getElementById('statusMsg');
         const bars = document.querySelectorAll('.bar');
         const viz = document.getElementById('viz');
+        const endedOverlay = document.getElementById('endedOverlay');
+        const inputBar = document.getElementById('inputBar');
 
         const MIC_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="23"></line><line x1="8" y1="23" x2="16" y2="23"></line></svg>`;
         const STOP_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect></svg>`;
 
-        toggleBtn.onclick = () => running ? stop() : start();
-        sendBtn.onclick = () => sendTextMessage();
-        textInput.onkeypress = (e) => { if (e.key === 'Enter') sendTextMessage(); };
+        toggleBtn.onclick = () => { if(!sessionEnded) running ? stop() : start(); };
+        sendBtn.onclick = () => { if(!sessionEnded) sendTextMessage(); };
+        textInput.onkeypress = (e) => { if (e.key === 'Enter' && !sessionEnded) sendTextMessage(); };
 
         async function sendTextMessage() {
             const text = textInput.value.trim();
-            if (!text) return;
+            if (!text || sessionEnded) return;
             
             if (!ws || ws.readyState !== 1) await startWebSocketOnly();
 
@@ -623,7 +1090,9 @@ HTML_PAGE = """
             return new Promise((resolve) => {
                 ws.onopen = () => { statusMsg.textContent = 'Connected'; resolve(); };
                 ws.onmessage = (e) => e.data instanceof ArrayBuffer ? queueAudio(e.data) : onMsg(JSON.parse(e.data));
-                ws.onclose = () => { if (!running) statusMsg.textContent = 'Ready'; };
+                ws.onclose = () => { 
+                    if (!running && !sessionEnded) statusMsg.textContent = 'Ready'; 
+                };
             });
         }
 
@@ -631,6 +1100,7 @@ HTML_PAGE = """
         const CHUNK_SIZE = 4096;
 
         async function start() {
+            if (sessionEnded) return;
             try {
                 if (!pCtx) pCtx = new (window.AudioContext || window.webkitAudioContext)();
                 if (pCtx.state === 'suspended') await pCtx.resume();
@@ -638,7 +1108,6 @@ HTML_PAGE = """
                 stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 } });
                 aCtx = new AudioContext({ sampleRate: 16000 });
                 
-                // AudioWorklet for smoother processing
                 const workletCode = `
                   class PCMProcessor extends AudioWorkletProcessor {
                     process(inputs, outputs, parameters) {
@@ -658,9 +1127,8 @@ HTML_PAGE = """
                 const node = new AudioWorkletNode(aCtx, 'pcm-processor');
                 
                 node.port.onmessage = (e) => {
-                    if (!running || !ws || ws.readyState !== 1) return;
+                    if (!running || !ws || ws.readyState !== 1 || sessionEnded) return;
                     
-                    // Buffer chunks (Worklet is ~128 samples, we want ~4096)
                     const chunks = e.data;
                     for (let i = 0; i < chunks.length; i++) audioBuffer.push(chunks[i]);
                     
@@ -676,7 +1144,7 @@ HTML_PAGE = """
                 };
 
                 src.connect(node);
-                node.connect(aCtx.destination); // Keep alive
+                node.connect(aCtx.destination);
                 proc = node;
 
                 if (!ws || ws.readyState !== 1) {
@@ -693,24 +1161,22 @@ HTML_PAGE = """
 
         function stop(clearUI = false) {
             running = false;
-            // Clear audio buffer
             audioBuffer = [];
             
             if (proc) {
                  proc.disconnect();
-                 proc.port.onmessage = null; // Remove event listener
+                 proc.port.onmessage = null;
             }
             if (aCtx) aCtx.close();
             if (stream) stream.getTracks().forEach(t => t.stop());
-            // WEBSOCKET REMAINS OPEN FOR SESSION PERSISTENCE
+            
             toggleBtn.innerHTML = MIC_ICON;
             toggleBtn.classList.remove('active');
-            statusMsg.textContent = 'Ready';
+            statusMsg.textContent = (sessionEnded ? 'Chat Ended' : 'Ready');
             viz.classList.remove('active');
             resetViz();
             killAudio();
             if (clearUI) {
-                if (ws) ws.close();
                 clearChatUI();
             }
         }
@@ -718,16 +1184,30 @@ HTML_PAGE = """
         window.onbeforeunload = () => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({type: 'clear'})); if (ws) ws.close(); };
 
         function killAudio() { 
-            aQueue = []; 
-            playing = false; scheduledTime = 0;
-            if (activeSrc) { try { activeSrc.stop(); } catch(e) {} activeSrc = null; } 
+                    aQueue = []; 
+                    decodeQueue = [];
+                    playing = false; 
+                    scheduledTime = 0;
+                    decoding = false;
+                    if (activeSrc) { 
+                try { 
+                    activeSrc.stop(); 
+                    activeSrc.disconnect();
+                } catch(e) {} 
+                activeSrc = null; 
+            }
+            if (pCtx && pCtx.state === 'running') {
+                scheduledTime = pCtx.currentTime;
+            }
         }
 
         function onMsg(data) {
             switch (data.type) {
-                case 'processing': statusMsg.textContent = 'Thinking'; break;
+                case 'processing': 
+                    statusMsg.textContent = 'Thinking'; 
+                    tts_cancel = false;
+                    break;
                 case 'user_message': 
-                    // Only add if it's not the last text message we just sent manually
                     if (emptyState.style.display === 'flex' || chatArea.lastElementChild.textContent !== data.content) {
                         addMsg('user', data.content); 
                     }
@@ -735,22 +1215,87 @@ HTML_PAGE = """
                 case 'typing': showTyping(data.content); statusMsg.textContent = 'Speaking'; break;
                 case 'assistant_message': doneTyping(data.content); statusMsg.textContent = (running ? 'Listening' : 'Ready'); break;
                 case 'interrupt': 
-                    killAudio(); 
-                    if (typingMsg) { typingMsg.classList.add('interrupted'); doneTyping(typingMsg.textContent + " ... [Interrupted]"); }
+                    tts_cancel = true;
+                    killAudio();
+                    if (typingMsg) { 
+                        typingMsg.classList.add('interrupted'); 
+                        doneTyping(typingMsg.textContent + " ... [Interrupted]"); 
+                    }
+                    setTimeout(() => { killAudio(); }, 100);
                     break;
                 case 'clear': killAudio(); stop(true); statusMsg.textContent = 'Cleared'; break;
-                case 'shutdown': pendingShutdown = true; if (!playing) stop(true); break;
+                case 'shutdown': 
+                    pendingShutdown = true; 
+                    if (!playing) handleShutdownUI();
+                    break;
             }
         }
 
-        function clearChatUI() { chatArea.innerHTML = ''; chatArea.appendChild(emptyState); emptyState.style.display = 'flex'; typingMsg = null; }
-
-        async function queueAudio(buf) { 
-            try { const audioBuf = await pCtx.decodeAudioData(buf); aQueue.push(audioBuf); if (!playing) play(); } catch (err) { console.error("Audio decode error", err); }
+        function handleShutdownUI() {
+            sessionEnded = true;
+            statusMsg.textContent = 'Chat Ended';
+            endedOverlay.style.display = 'flex';
+            inputBar.style.opacity = '0.5';
+            textInput.disabled = true;
+            stop(false); // Stop mic if running
         }
 
+        function resetSession() {
+            sessionEnded = false;
+            pendingShutdown = false;
+            endedOverlay.style.display = 'none';
+            inputBar.style.opacity = '1';
+            textInput.disabled = false;
+            clearChat(); // This will clear backend and UI
+        }
+
+        function clearChatUI() { 
+            chatArea.innerHTML = ''; 
+            chatArea.appendChild(emptyState); 
+            emptyState.style.display = 'flex'; 
+            typingMsg = null; 
+        }
+
+        async function queueAudio(buf) { 
+            if (tts_cancel) {
+                return;
+            }
+            if (decodeQueue.length > 20) {
+                console.warn("Audio queue overflow, clearing old data");
+                decodeQueue = [];
+                killAudio();
+            }
+            decodeQueue.push(buf);
+            processDecodeQueue();
+        }
+
+        async function processDecodeQueue() {
+            if (decoding || decodeQueue.length === 0) return;
+            decoding = true;
+            
+            while (decodeQueue.length > 0) {
+                const buf = decodeQueue.shift();
+                try { 
+                    const bufCopy = buf.slice(0);
+                    const audioBuf = await pCtx.decodeAudioData(bufCopy); 
+                    aQueue.push(audioBuf); 
+                    if (!playing) play(); 
+                } catch (err) { 
+                    console.error("Audio decode error", err); 
+                }
+            }
+            
+            decoding = false;
+        }
         async function play() {
-            if (aQueue.length === 0) { playing = false; if (pendingShutdown) setTimeout(() => stop(true), 500); return; }
+            if (aQueue.length === 0) { 
+                playing = false; 
+                scheduledTime = 0;
+                if (pendingShutdown) {
+                    setTimeout(() => handleShutdownUI(), 800);
+                }
+                return; 
+            }
             playing = true;
             const audioBuf = aQueue.shift();
             try {
@@ -758,12 +1303,21 @@ HTML_PAGE = """
                 src.buffer = audioBuf;
                 src.connect(pCtx.destination);
                 activeSrc = src;
+                
                 const now = pCtx.currentTime;
-                if (scheduledTime < now) scheduledTime = now + 0.02;
-                src.start(scheduledTime);
-                scheduledTime += audioBuf.duration;
-                src.onended = () => play();
-            } catch (e) { play(); }
+                const startTime = Math.max(now + 0.01, scheduledTime);
+                src.start(startTime);
+                scheduledTime = startTime + audioBuf.duration;
+                
+                src.onended = () => {
+                    activeSrc = null;
+                    play();
+                };
+            } catch (e) { 
+                console.error("Playback error:", e);
+                activeSrc = null;
+                play(); 
+            }
         }
 
         function addMsg(role, text) {
@@ -821,67 +1375,154 @@ async def index(): return HTML_PAGE
 async def ws_chat(websocket: WebSocket):
     await websocket.accept()
     logger.info("Connection accepted")
+    
     vad = SileroVADWrapper()
+    ws_lock = asyncio.Lock()
+    shutdown_event = asyncio.Event()
     response_task: Optional[asyncio.Task] = None
-    
-    # Session-specific state
+    # dg_client = DeepgramClient()
+    # session_agent = SimpleAgent(use_rag=True)
+    # session_history: List[dict] = []
+    # session_id = str(uuid.uuid4())
+    # session_history.append({"session_id": session_id, "role": "system", "content": "Session Init"})
     dg_client = DeepgramClient()
+    tts_manager = DeepgramTTSManager(dg_client)  # <-- ADD THIS LINE
+    tts_manager.connect()  # <-- ADD THIS LINE (pre-connect to eliminate first delay)
     session_agent = SimpleAgent(use_rag=True)
-
     session_history: List[dict] = []
-    
-    # Generate Session ID
     session_id = str(uuid.uuid4())
-    # Stash session_id in the first history item as metadata (hidden) or just keep track
-    # We'll put it in a metadata dict in the first item if we want to retrieve it later easily
-    # or just use scope. But passing it to functions is cleaner.
-    # For now, let's just append a metadata item that won't be rendered
     session_history.append({"session_id": session_id, "role": "system", "content": "Session Init"})
-
+    # State for real-time STT
+    transcript_buffer = []
+    last_speech_time = None
+    last_activity_time = asyncio.get_event_loop().time()
     
-    # Send welcome message
-    welcome_text = "Hi, I am Aura from BharatLogic. How can I help you today?"
+    # Initialize Deepgram Live Transcription
+    dg_connection = dg_client.listen.asynclive.v("1")
+
+    async def on_transcript(self, result, **kwargs):
+        nonlocal last_speech_time
+        try:
+            transcript = result.channel.alternatives[0].transcript
+            if not transcript:
+                return
+
+            # Update speech time
+            last_speech_time = asyncio.get_event_loop().time()
+            
+            # Use 'user_message' to match frontend expected type
+            # (REMOVED: partial transcripts are no longer sent to UI)
+            # async with ws_lock:
+            #     await websocket.send_json({"type": "user_message", "content": transcript})
+            
+            if result.is_final:
+                transcript_buffer.append(transcript)
+                logger.debug(f"Live Transcript (is_final): {transcript}")
+        except Exception as e:
+            logger.error(f"Error in on_transcript callback: {e}")
+
+    async def on_error(self, error, **kwargs):
+        logger.error(f"Deepgram Live Error: {error}")
+
+    dg_connection.on(LiveTranscriptionEvents.Transcript, on_transcript)
+    dg_connection.on(LiveTranscriptionEvents.Error, on_error)
+
+    options = LiveOptions(
+        model="nova-2",
+        language="en",
+        encoding="linear16",
+        sample_rate=16000,
+        channels=1,
+        punctuate=True,
+        smart_format=True,
+    )
+    
+    from concurrent.futures import ThreadPoolExecutor
+    executor = ThreadPoolExecutor(max_workers=5)
+    
     try:
-        await websocket.send_json({"type": "typing", "content": welcome_text})
-        # Update agent history
+        await dg_connection.start(options)
+        
+        # Welcome message with TTS (only once)
+        welcome_text = "Hi, I am Aura from BharatLogic. How can I help you today?"
         from langchain_core.messages import AIMessage
+        
+        # Send text to UI
+        async with ws_lock:
+            await websocket.send_json({"type": "assistant_message", "content": welcome_text})
+        
+        # Add to history
         session_agent.history.append(AIMessage(content=welcome_text))
         session_history.append({"role": "assistant", "content": welcome_text})
         
-        # Audio for welcome message (disabled as per request)
-        # for audio_chunk in text_to_speech(welcome_text, dg_client):
-        #     await websocket.send_bytes(audio_to_bytes(audio_chunk))
-        
-        await websocket.send_json({"type": "assistant_message", "content": welcome_text})
-    except Exception as e:
-        logger.error(f"Error sending welcome message: {e}")
-    
-    try:
-        await websocket.send_json({"type": "listening"})
-        while True:
-            message = await websocket.receive()
+        # Send TTS audio
+        for audio_chunk in tts_manager.speak(welcome_text):
+            async with ws_lock:
+                await websocket.send_bytes(audio_to_bytes(audio_chunk))
+
+        while not shutdown_event.is_set():
+            # Check for silence finalization with dynamic threshold and VAD awareness
+            if last_speech_time and transcript_buffer:
+                silence_duration = asyncio.get_event_loop().time() - last_speech_time
+                
+                # Determine threshold: shorter if user finished a punctuation-ended sentence
+                current_text = " ".join(transcript_buffer).strip()
+                threshold = 1 if current_text.endswith(('.', '?', '!',',')) else 1.5
+                
+                # Only finalize if silence threshold is met AND VAD confirms user isn't speaking
+                if silence_duration >= threshold and not vad.is_speaking:
+                    final_text = current_text
+                    transcript_buffer.clear()
+                    last_speech_time = None
+                    
+                    if final_text:
+                        logger.info(f"Finalized speech: {final_text}")
+                        if response_task and not response_task.done():
+                            response_task.cancel()
+                        
+                        # Send finalized message to UI exactly once
+                        async with ws_lock:
+                            await websocket.send_json({"type": "user_message", "content": final_text})
+
+                        # call: process_chat_common(final_text, session_agent, session_history, dg_client, stop_flag, suppress_tts=False)
+                        response_task = asyncio.create_task(handle_inference(websocket, session_agent, session_history, dg_client, executor, tts_manager, process_chat_common, final_text, ws_lock=ws_lock, shutdown_event=shutdown_event, suppress_tts=False))
+            # Receive message with timeout (0.1s for silence check, 5s for keep-alive)
+            try:
+                message = await asyncio.wait_for(websocket.receive(), timeout=0.1)
+                last_activity_time = asyncio.get_event_loop().time()
+            except asyncio.TimeoutError:
+                # Send KeepAlive JSON every 5s of silence to keep Deepgram connection alive
+                if asyncio.get_event_loop().time() - last_activity_time > 5.0:
+                    try:
+                        # await dg_connection.send(b'\x00' * 320)
+                        import json
+                        await dg_connection.send(json.dumps({"type": "KeepAlive"}))
+                        last_activity_time = asyncio.get_event_loop().time()
+                    except: pass
+                continue
+
             if message["type"] == "websocket.disconnect":
                 logger.info("Websocket message: Disconnect received")
                 break
                 
             if "bytes" in message:
-                data = message["bytes"]
-                audio_chunk = np.frombuffer(data, dtype=np.int16)
+                audio_bytes = message["bytes"]
+                # 1. Feed to Deepgram for STT
+                try:
+                    await dg_connection.send(audio_bytes)
+                except Exception as e:
+                    logger.error(f"Error sending audio to Deepgram: {e}")
                 
-                # Process VAD
-                events = vad.process(audio_chunk)
-                for event_type, payload in events:
+                # 2. Feed to Silero VAD for robust interruption detection
+                audio_chunk = np.frombuffer(audio_bytes, dtype=np.int16)
+                vad_events = vad.process(audio_chunk)
+                for event_type, _ in vad_events:
                     if event_type == "start_speech":
-                        # Always send interrupt to stop active TTS on client
+                        # Human speech detected - trigger immediate interrupt
                         await websocket.send_json({"type": "interrupt"})
                         if response_task and not response_task.done():
-                            logger.info("In-progress response task cancelled")
+                            logger.info("In-progress response task cancelled via Silero VAD interrupt")
                             response_task.cancel()
-                    
-                    elif event_type == "end_speech":
-                        logger.info("Speech segment complete, start inference")
-                        audio_tuple = (16000, payload)
-                        response_task = asyncio.create_task(handle_inference(websocket, session_agent, session_history, dg_client, process_audio_sync, audio_tuple))
             
             elif "text" in message:
                 import json
@@ -890,24 +1531,46 @@ async def ws_chat(websocket: WebSocket):
                     if payload.get("type") == "chat":
                         content = payload.get("content")
                         logger.info(f"Received text chat: {content}")
-                        # Interrupt previous response if any
                         if response_task and not response_task.done():
                             response_task.cancel()
-                        response_task = asyncio.create_task(handle_inference(websocket, session_agent, session_history, dg_client, process_text_chat, content))
-                    
+                        response_task = asyncio.create_task(handle_inference(websocket, session_agent, session_history, dg_client, executor, tts_manager, process_chat_common, content, ws_lock=ws_lock, shutdown_event=shutdown_event, suppress_tts=True))
                     elif payload.get("type") == "interrupt":
+                        tts_manager.cancel()
                         if response_task and not response_task.done():
                             logger.info("Manual interrupt received, cancelling task")
                             response_task.cancel()
                             
                     elif payload.get("type") == "clear":
                         logger.warning("Backend memory reset confirmed by UI command")
+                        try:
+                            if len(session_agent.history) > 1:
+                                summary_data = session_agent.generate_summary()
+                                save_conversation_summary(session_id, summary_data, session_history)
+                        except Exception as e:
+                            logger.error(f"Error saving summary on UI clear: {e}")
+                            
                         session_history.clear()
                         session_agent.clear_history()
-                        await websocket.send_json({"type": "clear"})
+                        async with ws_lock:
+                            await websocket.send_json({"type": "clear"})
+
+                        # Re-initialize session
+                        session_id = str(uuid.uuid4())
+                        session_history.append({"session_id": session_id, "role": "system", "content": "Session Init"})
+                        
+                        # Welcome message (text only, no TTS on clear to avoid double)
+                        welcome_text = "Hi, I am Aura from BharatLogic. How can I help you today?"
+                        from langchain_core.messages import AIMessage
+                        session_agent.history.append(AIMessage(content=welcome_text))
+                        session_history.append({"role": "assistant", "content": welcome_text})
+                        async with ws_lock:
+                            await websocket.send_json({"type": "assistant_message", "content": welcome_text})
                     elif payload.get("type") == "shutdown":
                         logger.warning("Backend received shutdown signal")
-                        await websocket.send_json({"type": "shutdown"})
+                        async with ws_lock:
+                            await websocket.send_json({"type": "shutdown"})
+                        shutdown_event.set()
+                        break 
                 except Exception as e:
                     logger.error(f"Text parse error: {e}")
 
@@ -921,41 +1584,78 @@ async def ws_chat(websocket: WebSocket):
             logger.error(f"WS error: {e}")
 
     finally:
+        if executor:
+            executor.shutdown(wait=False)
+            logger.info("Session thread pool executor shut down")
+
+        tts_manager.close()
+
         if response_task: 
             logger.info("Cleaning up session: cancelling active response task")
             response_task.cancel()
+        
+        try:
+            await dg_connection.finish()
+            logger.info("Deepgram Live connection finished")
+        except:
+            pass
+        
+        # Save summary before clearing history (on any disconnect/crash)
+        try:
+            if len(session_agent.history) > 1:  # More than just system message
+                logger.info("Generating summary before session cleanup...")
+                summary_data = session_agent.generate_summary()
+                save_conversation_summary(session_id, summary_data, session_history)
+        except Exception as e:
+            logger.error(f"Error saving summary on disconnect: {e}")
+        
         session_history.clear()
         session_agent.clear_history()
         logger.info("Session state cleared")
 
-async def handle_inference(websocket: WebSocket, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, func, *args):
+# async def handle_inference(websocket: WebSocket, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, executor, func, *args, ws_lock: asyncio.Lock = None, shutdown_event: asyncio.Event = None, suppress_tts: bool = False):
+async def handle_inference(websocket: WebSocket, session_agent: SimpleAgent, session_history: List[dict], dg_client: DeepgramClient, executor, tts_manager: DeepgramTTSManager, func, *args, ws_lock: asyncio.Lock = None, shutdown_event: asyncio.Event = None, suppress_tts: bool = False): 
     """Handles the async-sync inference pipeline with comprehensive error handling."""
     stop_flag = threading.Event()
     try:
-        await websocket.send_json({"type": "processing"})
+        async with ws_lock:
+            await websocket.send_json({"type": "processing"})
         typing_count = 0
-        async for event_type, content in run_sync_gen_in_thread(func, *args, session_agent, session_history, dg_client, stop_flag=stop_flag):
+        # Signature: (text, session_agent, session_history, dg_client, executor, stop_flag=None, suppress_tts=False)
+        async for event_type, content in run_sync_gen_in_thread(
+            func, *args, session_agent, session_history, dg_client, executor, tts_manager=tts_manager, stop_flag=stop_flag, suppress_tts=suppress_tts
+        ):
             try:
                 if event_type == "chat_user": 
-                    await websocket.send_json({"type": "user_message", "content": content})
+                    async with ws_lock:
+                        await websocket.send_json({"type": "user_message", "content": content})
                 elif event_type == "typing": 
                     typing_count += 1
-                    await websocket.send_json({"type": "typing", "content": content})
+                    async with ws_lock:
+                        await websocket.send_json({"type": "typing", "content": content})
                 elif event_type == "clear": 
-                    await websocket.send_json({"type": "clear"})
+                    async with ws_lock:
+                        await websocket.send_json({"type": "clear"})
                 elif event_type == "shutdown": 
-                    await websocket.send_json({"type": "shutdown"})
+                    logger.info("Shutdown detected in inference stream")
+                    async with ws_lock:
+                        await websocket.send_json({"type": "shutdown"})
+                    if shutdown_event:
+                        shutdown_event.set()
                 elif event_type == "audio":
                     sr, arr = content
-                    await websocket.send_bytes(audio_to_bytes((sr, arr)))
+                    # logger.debug(f"Sending audio event (SR={sr}, bytes={len(arr.tobytes())})")
+                    async with ws_lock:
+                        await websocket.send_bytes(audio_to_bytes((sr, arr)))
                 elif event_type == "chat_assistant": 
                     logger.info(f"Final response sent. Typing events emitted: {typing_count}")
-                    await websocket.send_json({"type": "assistant_message", "content": content})
+                    async with ws_lock:
+                        await websocket.send_json({"type": "assistant_message", "content": content})
                 elif event_type == "error": 
-                    await websocket.send_json({"type": "error", "message": content})
+                    async with ws_lock:
+                        await websocket.send_json({"type": "error", "message": content})
             except Exception as send_error:
                 logger.error(f"Error sending {event_type}: {send_error}")
-                # If we can't send, the connection is likely broken, so break the loop
                 break
     except asyncio.CancelledError: 
         logger.info("Response task cancelled, signalling background thread")
@@ -963,9 +1663,10 @@ async def handle_inference(websocket: WebSocket, session_agent: SimpleAgent, ses
     except Exception as e: 
         logger.error(f"Inference pipeline failure: {e}")
         try:
-            await websocket.send_json({"type": "error", "message": "An error occurred processing your request."})
+            async with ws_lock:
+                await websocket.send_json({"type": "error", "message": "An error occurred processing your request."})
         except:
-            pass  # Connection already closed
+            pass  
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

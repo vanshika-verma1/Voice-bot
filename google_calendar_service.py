@@ -8,10 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Scopes required for the Service Account
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
-
-# Use the calendar ID from ENV or default to primary
 CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 
 def get_calendar_service():
@@ -80,20 +77,17 @@ def create_event(summary, start_time_iso, end_time_iso, description="", attendee
         try:
             event = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
         except HttpError as error:
-            # Handle "Service accounts cannot invite attendees" error (403)
-            # We retry without the attendee, but add them to description
             if error.resp.status == 403 and "Service accounts cannot invite attendees" in str(error):
                 logger.warning("Service account cannot invite attendees. Retrying without attendee list.")
                 if 'attendees' in event:
                     del event['attendees']
-                    # Append to description
                     event['description'] = f"{event.get('description', '')}\n\nAttendee: {attendee_email}".strip()
                 event = service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
             else:
                 raise error
 
         logger.info(f"Event created in background: {event.get('htmlLink')}")
-        return event  # Return the full event dict, let agent handle the message
+        return event  
 
     except HttpError as error:
         logger.error(f"Calendar API error: {error}")

@@ -8,7 +8,6 @@ from loguru import logger
 
 from .embeddings import load_pdfs, chunk_documents
 
-# Default paths
 DEFAULT_PDF_FOLDER = "pdfs"
 DEFAULT_INDEX_PATH = "rag/faiss_index"
 
@@ -24,13 +23,11 @@ def create_vector_store(
     """Create FAISS vector store from PDFs and save to disk."""
     logger.info(f"Creating vector store from: {pdf_folder}")
     
-    # Load and chunk PDFs
     documents = load_pdfs(pdf_folder)
     if not documents:
         logger.error("No documents loaded. Vector store creation aborted.")
         return None
     
-    # Save combined text to a file for verification
     text_file_path = Path("rag/extracted_text.txt")
     combined_text = "\n\n--- PAGE BREAK ---\n\n".join([doc.page_content for doc in documents])
     try:
@@ -41,11 +38,9 @@ def create_vector_store(
         
     chunks = chunk_documents(documents, chunk_size=chunk_size)
     
-    # Create embeddings and vector store
     embeddings = get_embeddings()
     vector_store = FAISS.from_documents(chunks, embeddings)
     
-    # Save to disk
     Path(index_path).parent.mkdir(parents=True, exist_ok=True)
     vector_store.save_local(index_path)
     logger.info(f"Vector store saved to: {index_path}")

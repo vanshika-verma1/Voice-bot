@@ -1,19 +1,12 @@
 import os
 from pathlib import Path
 from typing import List
-
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from loguru import logger
 
 def load_pdfs(pdf_folder: str) -> List[Document]:
-    """
-    Load all PDF files from a folder.
-    Uses PyMuPDF which is fast and handles most text and images well.
-    For OCR, LangChain's PyMuPDFLoader can be used with extract_images=True
-    if desired, but we'll stick to robust text extraction first.
-    """
     pdf_path = Path(pdf_folder)
     if not pdf_path.exists():
         logger.error(f"PDF folder not found: {pdf_folder}")
@@ -28,7 +21,6 @@ def load_pdfs(pdf_folder: str) -> List[Document]:
     
     for pdf_file in pdf_files:
         try:
-            # PyMuPDFLoader is generally better for complex layouts
             loader = PyMuPDFLoader(str(pdf_file))
             docs = loader.load()
             documents.extend(docs)
@@ -39,13 +31,11 @@ def load_pdfs(pdf_folder: str) -> List[Document]:
     logger.info(f"Total pages loaded: {len(documents)}")
     return documents
 
-
 def chunk_documents(
     documents: List[Document],
     chunk_size: int = 500,
     chunk_overlap: int = 50
 ) -> List[Document]:
-    """Split documents into smaller chunks for better retrieval."""
     if not documents:
         return []
         
@@ -61,7 +51,6 @@ def chunk_documents(
     return chunks
 
 if __name__ == "__main__":
-    # Test loading
     from dotenv import load_dotenv
     load_dotenv()
     docs = load_pdfs("pdfs")

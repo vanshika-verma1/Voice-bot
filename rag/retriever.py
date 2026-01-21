@@ -41,8 +41,6 @@ class RAGRetriever:
         """Check if vector store is loaded."""
         return self._vector_store is not None
 
-
-# Global retriever instance
 _retriever: Optional[RAGRetriever] = None
 
 
@@ -52,5 +50,3 @@ def get_relevant_context(query: str, k: int = 3) -> str:
     if _retriever is None:
         _retriever = RAGRetriever()
     return _retriever.get_context(query, k=k)
-
-
