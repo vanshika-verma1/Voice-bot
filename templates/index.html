@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>BharatLogic Voice Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary-blue: #0066FF;
+            --primary-dark: #0052CC;
+            --dark-bg: #0A1628;
+            --dark-secondary: #1A2940;
+            --dark-card: #162032;
+            --text-white: #FFFFFF;
+            --text-gray: #94A3B8;
+            --text-light: #CBD5E1;
+            --accent-green: #10B981;
+            --accent-red: #EF4444;
+            --border-color: #2D3F59;
+        }
+
+        html,
+        body {
+            height: 100%;
+            overflow: hidden;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--dark-bg);
+            min-height: 100vh;
+            min-height: -webkit-fill-available;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 16px;
+        }
+
+        /* Container */
+        .container {
+            width: 100%;
+            max-width: 480px;
+            background: var(--dark-secondary);
+            border-radius: 16px;
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: calc(100vh - 32px);
+            max-height: 720px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+
+        /* Header */
+        .header {
+            background: var(--dark-card);
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            min-width: 40px;
+            background: var(--primary-blue);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .logo-icon svg {
+            width: 22px;
+            height: 22px;
+            fill: white;
+        }
+
+        .header-text {
+            overflow: hidden;
+        }
+
+        .header-text h1 {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text-white);
+            margin-bottom: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .header-text span {
+            font-size: 0.75rem;
+            color: var(--text-gray);
+        }
+
+        /* Status Bar */
+        .status-bar {
+            padding: 10px 16px;
+            background: var(--dark-card);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            min-width: 8px;
+            border-radius: 50%;
+            background: var(--text-gray);
+            transition: all 0.3s ease;
+        }
+
+        .status-dot.connected {
+            background: var(--accent-green);
+            box-shadow: 0 0 10px var(--accent-green);
+        }
+
+        .status-dot.ended {
+            background: var(--accent-red);
+        }
+
+        .status-text {
+            font-size: 0.75rem;
+            color: var(--text-gray);
+            font-weight: 500;
+        }
+
+        /* Chat Box */
+        .chat-box {
+            flex: 1;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            background: var(--dark-bg);
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .chat-box::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        .chat-box::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .chat-box::-webkit-scrollbar-thumb {
+            background: var(--border-color);
+            border-radius: 2px;
+        }
+
+        /* Messages */
+        .message {
+            max-width: 85%;
+            padding: 12px 16px;
+            border-radius: 16px;
+            font-size: 0.875rem;
+            line-height: 1.5;
+            animation: slideIn 0.3s ease;
+            word-wrap: break-word;
+            word-break: break-word;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .user-msg {
+            background: var(--primary-blue);
+            color: var(--text-white);
+            align-self: flex-end;
+            border-bottom-right-radius: 4px;
+        }
+
+        .agent-msg {
+            background: var(--dark-secondary);
+            color: var(--text-light);
+            align-self: flex-start;
+            border-bottom-left-radius: 4px;
+            border: 1px solid var(--border-color);
+        }
+
+        .system-msg {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--accent-red);
+            align-self: center;
+            font-size: 0.75rem;
+            padding: 8px 16px;
+            border-radius: 20px;
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+
+        /* Empty State */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-gray);
+            gap: 16px;
+            text-align: center;
+            padding: 24px;
+        }
+
+        .empty-icon {
+            width: 70px;
+            height: 70px;
+            background: var(--dark-secondary);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--border-color);
+        }
+
+        .empty-icon svg {
+            width: 32px;
+            height: 32px;
+            stroke: var(--text-gray);
+        }
+
+        .empty-state h3 {
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text-light);
+        }
+
+        .empty-state p {
+            font-size: 0.8rem;
+            color: var(--text-gray);
+            max-width: 250px;
+        }
+
+        /* Controls */
+        .controls {
+            padding: 16px;
+            background: var(--dark-card);
+            border-top: 1px solid var(--border-color);
+            display: flex;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+
+        button {
+            flex: 1;
+            padding: 14px 16px;
+            border: none;
+            border-radius: 12px;
+            font-size: 0.875rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        #btn-start {
+            background: var(--primary-blue);
+            color: white;
+        }
+
+        #btn-start:hover:not(:disabled) {
+            background: var(--primary-dark);
+        }
+
+        #btn-start:active:not(:disabled) {
+            transform: scale(0.98);
+        }
+
+        #btn-stop {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--accent-red);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+
+        #btn-stop:hover:not(:disabled) {
+            background: rgba(239, 68, 68, 0.2);
+        }
+
+        #btn-stop:active:not(:disabled) {
+            transform: scale(0.98);
+        }
+
+        button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        button svg {
+            flex-shrink: 0;
+        }
+
+        /* ========== RESPONSIVE STYLES ========== */
+
+        /* Mobile - Small (up to 360px) */
+        @media (max-width: 360px) {
+            body {
+                padding: 0;
+            }
+
+            .container {
+                height: 100vh;
+                height: -webkit-fill-available;
+                max-height: none;
+                border-radius: 0;
+                border: none;
+            }
+
+            .header {
+                padding: 12px 16px;
+            }
+
+            .logo-icon {
+                width: 36px;
+                height: 36px;
+                min-width: 36px;
+            }
+
+            .header-text h1 {
+                font-size: 0.9rem;
+            }
+
+            .header-text span {
+                font-size: 0.7rem;
+            }
+
+            .chat-box {
+                padding: 12px;
+                gap: 10px;
+            }
+
+            .message {
+                max-width: 90%;
+                padding: 10px 14px;
+                font-size: 0.8rem;
+            }
+
+            .controls {
+                padding: 12px;
+                gap: 8px;
+            }
+
+            button {
+                padding: 12px 14px;
+                font-size: 0.8rem;
+            }
+
+            .empty-icon {
+                width: 60px;
+                height: 60px;
+            }
+
+            .empty-icon svg {
+                width: 28px;
+                height: 28px;
+            }
+
+            .empty-state h3 {
+                font-size: 0.9rem;
+            }
+
+            .empty-state p {
+                font-size: 0.75rem;
+            }
+        }
+
+        /* Mobile - Standard (361px to 480px) */
+        @media (min-width: 361px) and (max-width: 480px) {
+            body {
+                padding: 0;
+            }
+
+            .container {
+                height: 100vh;
+                height: -webkit-fill-available;
+                max-height: none;
+                border-radius: 0;
+                border: none;
+            }
+        }
+
+        /* Tablet (481px to 768px) */
+        @media (min-width: 481px) and (max-width: 768px) {
+            body {
+                padding: 20px;
+            }
+
+            .container {
+                max-width: 500px;
+                height: calc(100vh - 40px);
+                max-height: 800px;
+            }
+        }
+
+        /* Desktop (769px and up) */
+        @media (min-width: 769px) {
+            body {
+                padding: 24px;
+            }
+
+            .container {
+                max-width: 480px;
+                height: calc(100vh - 48px);
+                max-height: 720px;
+            }
+
+            .header {
+                padding: 20px 24px;
+            }
+
+            .header-text h1 {
+                font-size: 1.1rem;
+            }
+
+            .chat-box {
+                padding: 20px;
+            }
+
+            .message {
+                font-size: 0.9rem;
+            }
+
+            .controls {
+                padding: 20px 24px;
+            }
+
+            button {
+                padding: 14px 24px;
+            }
+        }
+
+        /* Large Desktop (1200px and up) */
+        @media (min-width: 1200px) {
+            .container {
+                max-width: 520px;
+                max-height: 780px;
+            }
+        }
+
+        /* Landscape Mobile */
+        @media (max-height: 500px) and (orientation: landscape) {
+            .container {
+                max-height: none;
+                height: 100vh;
+            }
+
+            .header {
+                padding: 10px 16px;
+            }
+
+            .logo-icon {
+                width: 32px;
+                height: 32px;
+                min-width: 32px;
+            }
+
+            .header-text h1 {
+                font-size: 0.85rem;
+            }
+
+            .status-bar {
+                padding: 6px 16px;
+            }
+
+            .chat-box {
+                padding: 10px 16px;
+                gap: 8px;
+            }
+
+            .message {
+                padding: 8px 12px;
+                font-size: 0.8rem;
+            }
+
+            .controls {
+                padding: 10px 16px;
+            }
+
+            button {
+                padding: 10px 16px;
+            }
+
+            .empty-state {
+                padding: 16px;
+                gap: 10px;
+            }
+
+            .empty-icon {
+                width: 50px;
+                height: 50px;
+            }
+
+            .empty-icon svg {
+                width: 24px;
+                height: 24px;
+            }
+
+            .empty-state h3 {
+                font-size: 0.85rem;
+            }
+
+            .empty-state p {
+                font-size: 0.7rem;
+            }
+        }
+
+        /* Safe area for notched phones (iPhone X, etc.) */
+        @supports (padding: max(0px)) {
+            .header {
+                padding-top: max(16px, env(safe-area-inset-top));
+            }
+
+            .controls {
+                padding-bottom: max(16px, env(safe-area-inset-bottom));
+            }
+        }
+
+        /* Dark mode preference (already dark, but ensure contrast) */
+        @media (prefers-color-scheme: dark) {
+            :root {
+                color-scheme: dark;
+            }
+        }
+
+        /* Reduced motion preference */
+        @media (prefers-reduced-motion: reduce) {
+            .message {
+                animation: none;
+            }
+
+            .status-dot.connected {
+                box-shadow: none;
+            }
+
+            button {
+                transition: none;
+            }
+        }
+
+        /* High contrast mode */
+        @media (prefers-contrast: high) {
+            .message {
+                border: 2px solid currentColor;
+            }
+
+            button {
+                border: 2px solid currentColor;
+            }
+        }
+
+        /* Print styles */
+        @media print {
+            body {
+                background: white;
+            }
+
+            .container {
+                box-shadow: none;
+                border: 1px solid #ccc;
+            }
+
+            .controls {
+                display: none;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="logo-icon">
+                <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M12 2L2 7L12 12L22 7L12 2Z" fill="white" />
+                    <path d="M2 17L12 22L22 17" stroke="white" stroke-width="2" stroke-linecap="round"
+                        stroke-linejoin="round" />
+                    <path d="M2 12L12 17L22 12" stroke="white" stroke-width="2" stroke-linecap="round"
+                        stroke-linejoin="round" />
+                </svg>
+            </div>
+            <div class="header-text">
+                <h1>BharatLogic AI Assistant</h1>
+                <span>Powered by Aura Voice AI</span>
+            </div>
+        </div>
+
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="status-indicator">
+                <div class="status-dot" id="status-dot"></div>
+                <span class="status-text" id="status-text">Ready to connect</span>
+            </div>
+        </div>
+
+        <!-- Chat Box -->
+        <div class="chat-box" id="chat-box">
+            <div class="empty-state" id="empty-state">
+                <div class="empty-icon">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5"
+                        stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round"
+                            d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" />
+                    </svg>
+                </div>
+                <h3>Start a Conversation</h3>
+                <p>Click "Start Chat" and speak to ask about BharatLogic's services</p>
+            </div>
+        </div>
+
+        <!-- Controls -->
+        <div class="controls">
+            <button id="btn-start">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M8 5v14l11-7z" />
+                </svg>
+                Start Chat
+            </button>
+            <button id="btn-stop" disabled>
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M6 6h12v12H6z" />
+                </svg>
+                Stop
+            </button>
+        </div>
+    </div>
+
+    <script type="module">
+        import { Room, RoomEvent, Track } from "https://cdn.jsdelivr.net/npm/livekit-client@2.5.5/+esm";
+
+        let currentRoom = null;
+        let sessionEnded = false;
+
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        const chatBox = document.getElementById('chat-box');
+        const emptyState = document.getElementById('empty-state');
+        const btnStart = document.getElementById('btn-start');
+        const btnStop = document.getElementById('btn-stop');
+
+        const END_PHRASES = [
+            'bye', 'goodbye', 'good bye', 'see you', 'take care',
+            'have a great day', 'have a nice day', 'talk later',
+            'thanks bye', 'thank you bye', 'ok bye', 'okay bye'
+        ];
+
+        function hideEmptyState() {
+            const empty = document.getElementById('empty-state');
+            if (empty) {
+                empty.style.display = 'none';
+            }
+        }
+
+        function addMessage(sender, text, isSystem = false) {
+            hideEmptyState();
+
+            const div = document.createElement('div');
+
+            if (isSystem) {
+                div.className = 'message system-msg';
+                div.textContent = text;
+            } else {
+                div.className = `message ${sender === 'user' ? 'user-msg' : 'agent-msg'}`;
+                div.textContent = text;
+            }
+
+            chatBox.appendChild(div);
+            chatBox.scrollTop = chatBox.scrollHeight;
+
+            if (!sessionEnded) {
+                const lowerText = text.toLowerCase().trim();
+                const isEndPhrase = END_PHRASES.some(phrase =>
+                    lowerText.includes(phrase)
+                );
+
+                if (isEndPhrase) {
+                    endSession();
+                }
+            }
+        }
+
+        function endSession() {
+            if (sessionEnded) return;
+            sessionEnded = true;
+
+            statusDot.className = 'status-dot ended';
+            statusText.textContent = 'Session ended';
+
+            if (currentRoom) {
+                currentRoom.disconnect();
+                currentRoom = null;
+            }
+
+            btnStart.disabled = false;
+            btnStart.innerHTML = `
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M8 5v14l11-7z"/>
+                </svg>
+                New Chat
+            `;
+            btnStop.disabled = false;
+
+            addMessage('', 'Session ended', true);
+        }
+
+        function clearChat() {
+            chatBox.innerHTML = `
+                <div class="empty-state" id="empty-state">
+                    <div class="empty-icon">
+                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z" />
+                        </svg>
+                    </div>
+                    <h3>Start a Conversation</h3>
+                    <p>Click "Start Chat" and speak to ask about BharatLogic's services</p>
+                </div>
+            `;
+        }
+
+        btnStart.onclick = async () => {
+            if (sessionEnded) {
+                clearChat();
+            }
+
+            sessionEnded = false;
+            statusText.textContent = "Connecting...";
+            statusDot.className = 'status-dot';
+            btnStart.disabled = true;
+
+            try {
+                const response = await fetch('/getToken');
+                const data = await response.json();
+
+                const room = new Room({
+                    adaptiveStream: true,
+                    dynacast: true
+                });
+                currentRoom = room;
+
+                room.on(RoomEvent.TrackSubscribed, (track) => {
+                    if (track.kind === Track.Kind.Audio) {
+                        const element = track.attach();
+                        document.body.appendChild(element);
+                    }
+                });
+
+                room.on(RoomEvent.TranscriptionReceived, (segments, participant) => {
+                    segments.forEach(segment => {
+                        if (segment.final && segment.text) {
+                            const text = segment.text.trim();
+                            if (!text) return;
+
+                            const isAgent = participant?.identity?.includes('agent') ||
+                                !participant?.identity?.startsWith('user');
+
+                            addMessage(isAgent ? 'agent' : 'user', text);
+                        }
+                    });
+                });
+
+                room.on(RoomEvent.Disconnected, () => {
+                    if (!sessionEnded) {
+                        statusDot.className = 'status-dot';
+                        statusText.textContent = 'Disconnected';
+                        btnStart.disabled = false;
+                        currentRoom = null;
+                    }
+                });
+
+                await room.connect(data.url, data.token);
+
+                statusDot.className = 'status-dot connected';
+                statusText.textContent = "Connected • Listening...";
+
+                await room.localParticipant.setMicrophoneEnabled(true);
+
+                btnStop.disabled = false;
+                hideEmptyState();
+
+            } catch (error) {
+                console.error("Connection Error:", error);
+                statusText.textContent = "Connection failed";
+                statusDot.className = 'status-dot ended';
+                btnStart.disabled = false;
+            }
+        };
+
+        btnStop.onclick = async () => {
+            if (currentRoom) {
+                await currentRoom.disconnect();
+                currentRoom = null;
+            }
+
+            sessionEnded = false;
+            clearChat();
+
+            statusDot.className = 'status-dot';
+            statusText.textContent = 'Ready to connect';
+            btnStart.disabled = false;
+            btnStart.innerHTML = `
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M8 5v14l11-7z"/>
+                </svg>
+                Start Chat
+            `;
+            btnStop.disabled = true;
+        };
+    </script>
+
+</body>
+
+</html>

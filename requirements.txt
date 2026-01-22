@@ -23,3 +23,6 @@ google-auth-oauthlib
 pymongo>=4.6.0
 phonenumbers
 email-validator
+jinja2
+# pip install livekit-agents livekit-plugins-openai livekit-plugins-deepgram livekit-plugins-silero
+# pip install -U livekit-agents livekit-plugins-openai livekit-plugins-deepgram livekit-plugins-silero
