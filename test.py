@@ -1,4 +1,8 @@
 import asyncio
+import uuid
+from dotenv import load_dotenv
+from loguru import logger
+
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -10,10 +14,30 @@ from livekit.agents import (
     room_io,
 )
 from livekit.plugins import openai, deepgram, silero
-from dotenv import load_dotenv
-from loguru import logger
+
+from session_summary import generate_session_summary
+from db_writer import save_conversation_summary
 
 load_dotenv()
+
+import logging
+from loguru import logger
+
+logging.getLogger("pymongo").handlers = []
+logging.getLogger("pymongo").propagate = False
+logging.getLogger("pymongo").setLevel(logging.WARNING)
+
+# 🔹 Separate LLM for summary (CRITICAL FIX)
+summary_llm = openai.LLM(model="gpt-4o-mini")
+
+
+class SessionState:
+    def __init__(self):
+        self.session_id = str(uuid.uuid4())
+        self.conversation_log = []
+        self.summary_saved = False
+        self.finalize_event = asyncio.Event()  # Track when finalize completes
+
 
 try:
     from rag.retriever import get_relevant_context
@@ -23,10 +47,8 @@ except ImportError:
 
 
 @function_tool
-async def search_company_info(_context: RunContext, query: str):
-    """Search BharatLogic's knowledge base. Pass user's FULL sentence."""
-    logger.info(f"🔍 RAG Query: '{query}'")
-    result = get_relevant_context(query, k=3)
+async def search_company_info(_context: RunContext, user_query: str):
+    result = get_relevant_context(user_query, k=5)
     if result:
         return {"context": result, "found": True}
     return {"context": "No specific info found.", "found": False}
@@ -34,12 +56,7 @@ async def search_company_info(_context: RunContext, query: str):
 
 @function_tool
 async def end_conversation(_context: RunContext):
-    """
-    End the conversation. Call this when the user says goodbye, bye, 
-    see you, take care, have a great day, or any farewell phrase.
-    """
-    logger.info("👋 Ending conversation...")
-    return {"status": "ended", "message": "Conversation ended by user request."}
+    return {"status": "ended"}
 
 
 SYSTEM_PROMPT = """
@@ -57,9 +74,49 @@ the 'end_conversation' tool.
 """
 
 
+async def finalize_session(state: SessionState):
+    if state.summary_saved:
+        state.finalize_event.set()
+        return
+
+    if len(state.conversation_log) < 2:
+        state.finalize_event.set()
+        return
+
+    logger.info("Generating session summary...")
+
+    try:
+        summary_json = await generate_session_summary(
+            summary_llm,
+            state.conversation_log
+        )
+
+        save_conversation_summary(
+            session_id=state.session_id,
+            summary_data=summary_json,
+            conversation_log=state.conversation_log
+        )
+
+        state.summary_saved = True
+        logger.info(f"Session summary saved: {state.session_id}")
+    except Exception as e:
+        logger.error(f"Failed to save summary: {e}")
+    finally:
+        state.finalize_event.set()
+
+
 async def entrypoint(ctx: JobContext):
     await ctx.connect()
-    logger.info(f"🚀 Connected to room: {ctx.room.name}")
+    logger.info(f"Connected to room: {ctx.room.name}")
+
+    state = SessionState()
+
+    # Register shutdown callback - this BLOCKS job exit until complete
+    @ctx.add_shutdown_callback
+    async def on_shutdown():
+        logger.info("Shutdown callback triggered, finalizing session...")
+        await finalize_session(state)
+        logger.info("Shutdown callback complete.")
 
     agent = Agent(
         instructions=SYSTEM_PROMPT,
@@ -77,29 +134,29 @@ async def entrypoint(ctx: JobContext):
     def on_item(event):
         role = event.item.role
         content = event.item.content
-        
-        if content:
-            # Handle content that might be a list
-            if isinstance(content, list):
-                text = content[0] if content else ""
-            else:
-                text = str(content)
-            
-            if text:
-                logger.info(f"{'👤 USER' if role == 'user' else '🤖 AGENT'}: {text}")
+
+        if isinstance(content, list) and content:
+            text = str(content[0])
+        elif isinstance(content, str):
+            text = content
+        else:
+            return
+
+        state.conversation_log.append({
+            "role": role,
+            "text": text
+        })
 
     @session.on("function_calls_finished")
     def on_function_done(event):
         for call in event.function_calls:
             if call.name == "end_conversation":
-                logger.info("📋 Session ending due to farewell...")
-                # Give time for final message to play, then disconnect
-                asyncio.create_task(delayed_disconnect(ctx, 3))
 
-    async def delayed_disconnect(ctx, delay):
-        await asyncio.sleep(delay)
-        logger.info("👋 Disconnecting from room...")
-        await ctx.room.disconnect()
+                async def close_flow():
+                    await finalize_session(state)
+                    await ctx.room.disconnect()
+
+                asyncio.create_task(close_flow())
 
     await session.start(
         agent=agent,
@@ -112,9 +169,11 @@ async def entrypoint(ctx: JobContext):
     )
 
     await session.generate_reply(
-        instructions="Say: Hello! I am Aura from BharatLogic. How can I help you today?"
+        instructions="Say exactly: Hello! I am Aura from BharatLogic. How can I help you today?"
     )
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    cli.run_app(
+        WorkerOptions(entrypoint_fnc=entrypoint)
+    )
