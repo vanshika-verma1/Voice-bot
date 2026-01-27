@@ -1,6 +1,9 @@
 from typing import List, Optional
 
-from .vector_store import load_vector_store, DEFAULT_INDEX_PATH
+try:
+    from .vector_store import load_vector_store, DEFAULT_INDEX_PATH
+except (ImportError, ValueError):
+    from vector_store import load_vector_store, DEFAULT_INDEX_PATH
 
 class RAGRetriever:
     """Singleton retriever that loads vector store once."""

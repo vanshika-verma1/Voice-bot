@@ -53,6 +53,6 @@ def chunk_documents(
 if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
-    docs = load_pdfs("pdfs")
+    docs = load_pdfs("data/pdfs")
     chunks = chunk_documents(docs)
     print(f"Test: {len(chunks)} chunks created.")

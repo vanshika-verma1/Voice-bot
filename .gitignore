@@ -1,4 +1,6 @@
 .env
 __pycache__
-__pycache__/
 service_account.json
+LICENSE
+bin
+rag/__pycache__

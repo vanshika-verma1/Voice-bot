@@ -13,11 +13,14 @@ CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "primary")
 
 def get_calendar_service():
     """Authenticates using a Service Account and returns the service object."""
-    if not os.path.exists("service_account.json"):
-        raise FileNotFoundError("service_account.json not found. Please provide the Service Account key.")
+    service_account_path = os.path.join(os.getcwd(), "config", "service_account.json")
+    if not os.path.exists(service_account_path):
+        service_account_path = os.path.join(os.path.dirname(__file__), "..", "config", "service_account.json")
+        if not os.path.exists(service_account_path):
+            raise FileNotFoundError(f"service_account.json not found at {service_account_path}.")
 
     creds = service_account.Credentials.from_service_account_file(
-        "service_account.json", scopes=SCOPES
+        service_account_path, scopes=SCOPES
     )
     return build("calendar", "v3", credentials=creds)
 

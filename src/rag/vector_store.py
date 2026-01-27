@@ -6,10 +6,13 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from loguru import logger
 
-from .embeddings import load_pdfs, chunk_documents
+try:
+    from .embeddings import load_pdfs, chunk_documents
+except (ImportError, ValueError):
+    from embeddings import load_pdfs, chunk_documents
 
-DEFAULT_PDF_FOLDER = "pdfs"
-DEFAULT_INDEX_PATH = "rag/faiss_index"
+DEFAULT_PDF_FOLDER = "data/pdfs"
+DEFAULT_INDEX_PATH = "src/rag/faiss_index"
 
 def get_embeddings() -> OpenAIEmbeddings:
     """Get OpenAI embeddings model."""
@@ -28,7 +31,7 @@ def create_vector_store(
         logger.error("No documents loaded. Vector store creation aborted.")
         return None
     
-    text_file_path = Path("rag/extracted_text.txt")
+    text_file_path = Path("src/rag/extracted_text.txt")
     combined_text = "\n\n--- PAGE BREAK ---\n\n".join([doc.page_content for doc in documents])
     try:
         text_file_path.write_text(combined_text, encoding="utf-8")

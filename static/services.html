@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BharatLogic - Our Services</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            margin: 0;
+            padding: 0;
+            background: #f8fafc;
+            color: #1e293b;
+            line-height: 1.6;
+        }
+
+        header {
+            background: #0066FF;
+            color: white;
+            padding: 60px 20px;
+            text-align: center;
+        }
+
+        nav {
+            background: #1e2940;
+            padding: 15px;
+            text-align: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            border-bottom: 1px solid #334155;
+        }
+
+        nav a {
+            color: white;
+            margin: 0 20px;
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.2s;
+        }
+
+        nav a:hover,
+        nav a.active {
+            color: #38bdf8;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        section {
+            margin-bottom: 100px;
+            padding: 40px;
+            background: white;
+            border-radius: 16px;
+            border: 1px solid #e2e8f0;
+            transition: transform 0.3s;
+        }
+
+        /* Add a style for the highlighting effect */
+        .highlight-target {
+            outline: 4px solid #F59E0B;
+            outline-offset: 4px;
+            border-color: #F59E0B !important;
+            transform: scale(1.02);
+        }
+
+        h2 {
+            color: #0f172a;
+            border-bottom: 2px solid #0066FF;
+            display: inline-block;
+            padding-bottom: 8px;
+            margin-bottom: 24px;
+        }
+
+        h3 {
+            color: #1e293b;
+            margin-top: 0;
+        }
+
+        .service-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+        }
+
+        .card {
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid #f1f5f9;
+            background: #f8fafc;
+        }
+
+        footer {
+            text-align: center;
+            padding: 60px 20px;
+            color: #64748b;
+            background: #f1f5f9;
+        }
+
+        /* Just to make the page long enough for scrolling */
+        .spacer {
+            height: 200px;
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <h1>Our Strategic Services</h1>
+        <p>Expertly crafted solutions for the modern digital era.</p>
+    </header>
+    <nav>
+        <a href="index.html">Home</a>
+        <a href="services.html" class="active">Services</a>
+        <a href="portfolio.html">Portfolio</a>
+        <a href="contact.html">Contact</a>
+    </nav>
+
+    <div class="container">
+        <section id="ai-services">
+            <h2>AI & Machine Learning</h2>
+            <div class="service-grid">
+                <div class="card" id="nlp-card">
+                    <h3>Natural Language Processing</h3>
+                    <p>Build intelligent bots and voice assistants that understand human context. We specialize in LLM
+                        integration and custom fine-tuning.</p>
+                    <button id="ai-demo-btn" onclick="alert('AI Demo Started!')"
+                        style="background: #0066FF; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; margin-top: 10px;">Start
+                        AI Demo</button>
+                </div>
+                <div class="card" id="vision-card">
+                    <h3>Computer Vision</h3>
+                    <p>Advanced image recognition and analysis systems for industrial and security applications.</p>
+                    <button id="vision-demo-btn"
+                        onclick="this.innerText='Vision Active!'; this.style.background='#10B981';"
+                        style="background: #0066FF; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; margin-top: 10px;">Enable
+                        Vision</button>
+                </div>
+            </div>
+        </section>
+
+        <section id="web-development">
+            <h2>Web Development</h2>
+            <div class="service-grid">
+                <div class="card" id="react-card">
+                    <h3>Modern Frameworks</h3>
+                    <p>High-performance applications built with React, Next.js, and Vue. Scaleable and reliable web
+                        solutions.</p>
+                </div>
+                <div class="card" id="cms-card">
+                    <h3>Enterprise Solutions</h3>
+                    <p>Custom CMS and ERP solutions tailored specifically to your business operations.</p>
+                </div>
+            </div>
+        </section>
+
+        <section id="cloud-infrastructure">
+            <h2>Cloud Infrastructure</h2>
+            <p>Moving to the cloud has never been easier. We manage AWS, Azure, and Google Cloud environments with
+                strict devops protocols.</p>
+            <div class="card" id="cloud-card">
+                <h3>Scalable Architecture</h3>
+                <p>We ensure your platform handles traffic spikes with ease using kubernetes and serverless
+                    architectures.</p>
+                <button id="cloud-check-btn" onclick="alert('Cloud Health: 100%')"
+                    style="background: #1e2940; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; margin-top: 10px;">Check
+                    System Health</button>
+            </div>
+        </section>
+
+        <section id="mobile-apps">
+            <h2>Mobile Applications</h2>
+            <p>Experience seamless performance on iOS and Android with our native and cross-platform app development
+                services.</p>
+            <div class="card" id="mobile-card">
+                <h3>App Design & UX</h3>
+                <p>User-centric design that drives engagement and retention for your mobile users.</p>
+            </div>
+        </section>
+
+        <div class="spacer"></div>
+    </div>
+
+    <footer>
+        <p>&copy; 2026 BharatLogic. Innovation simplified.</p>
+    </footer>
+    <script src="wp-integration.js"></script>
+</body>
+
+</html>
