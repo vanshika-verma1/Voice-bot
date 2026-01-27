@@ -838,12 +838,13 @@
                 statusText.textContent = "Connected • Listening...";
 
                 // debugLog('Requesting microphone permission...');
-                // try {
-                //     await room.localParticipant.setMicrophoneEnabled(true);
-                //     debugLog('Microphone enabled!');
-                // } catch (micError) {
-                //     debugLog(`Microphone error: ${micError.message}`, true);
-                // }
+                try {
+                    await room.localParticipant.setMicrophoneEnabled(true);
+                    // debugLog('Microphone enabled!');
+                } catch (micError) {
+                    console.error("Microphone error:", micError);
+                    // debugLog(`Microphone error: ${micError.message}`, true);
+                }
 
                 btnStop.disabled = false;
                 hideEmptyState();
