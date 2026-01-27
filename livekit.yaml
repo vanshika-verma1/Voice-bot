@@ -1,0 +1,24 @@
+# LiveKit Server Configuration with free TURN server for mobile access
+port: 7880
+
+rtc:
+  # Use your public IP for ICE candidates
+  use_external_ip: true
+  # Free public TURN servers (OpenRelay - no signup required)
+  turn_servers:
+    - host: openrelay.metered.ca
+      port: 80
+      username: openrelayproject
+      credential: openrelayproject
+      protocol: udp
+    - host: openrelay.metered.ca  
+      port: 443
+      username: openrelayproject
+      credential: openrelayproject
+      protocol: tcp
+
+keys:
+  devkey: secret
+
+logging:
+  level: info

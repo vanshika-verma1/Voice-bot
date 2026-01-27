@@ -679,6 +679,24 @@
         const btnStart = document.getElementById('btn-start');
         const btnStop = document.getElementById('btn-stop');
 
+        // // Debug logging function - shows errors on screen for mobile debugging
+        // function debugLog(message, isError = false) {
+        //     const time = new Date().toLocaleTimeString();
+        //     const logText = `[${time}] ${message}`;
+        //     console.log(logText);
+
+        //     // Show on screen
+        //     hideEmptyState();
+        //     const div = document.createElement('div');
+        //     div.className = 'message system-msg';
+        //     div.style.background = isError ? 'rgba(239, 68, 68, 0.2)' : 'rgba(16, 185, 129, 0.2)';
+        //     div.style.color = isError ? '#EF4444' : '#10B981';
+        //     div.style.fontSize = '0.7rem';
+        //     div.textContent = logText;
+        //     chatBox.appendChild(div);
+        //     chatBox.scrollTop = chatBox.scrollHeight;
+        // }
+
         const END_PHRASES = [
             'bye', 'goodbye', 'take care',
             'have a great day', 'have a nice day',
@@ -769,8 +787,10 @@
             btnStart.disabled = true;
 
             try {
+                // debugLog('Fetching token...');
                 const response = await fetch('/getToken');
                 const data = await response.json();
+                // debugLog(`Token received. Connecting to: ${data.url}`);
 
                 const room = new Room({
                     adaptiveStream: true,
@@ -782,6 +802,7 @@
                     if (track.kind === Track.Kind.Audio) {
                         const element = track.attach();
                         document.body.appendChild(element);
+                        // debugLog('Audio track attached');
                     }
                 });
 
@@ -800,6 +821,7 @@
                 });
 
                 room.on(RoomEvent.Disconnected, () => {
+                    // debugLog('Disconnected from room', true);
                     if (!sessionEnded) {
                         statusDot.className = 'status-dot';
                         statusText.textContent = 'Disconnected';
@@ -808,17 +830,26 @@
                     }
                 });
 
+                // debugLog('Connecting to room...');
                 await room.connect(data.url, data.token);
+                // debugLog('Room connected!');
 
                 statusDot.className = 'status-dot connected';
                 statusText.textContent = "Connected • Listening...";
 
-                await room.localParticipant.setMicrophoneEnabled(true);
+                // debugLog('Requesting microphone permission...');
+                // try {
+                //     await room.localParticipant.setMicrophoneEnabled(true);
+                //     debugLog('Microphone enabled!');
+                // } catch (micError) {
+                //     debugLog(`Microphone error: ${micError.message}`, true);
+                // }
 
                 btnStop.disabled = false;
                 hideEmptyState();
 
             } catch (error) {
+                // debugLog(`Connection Error: ${error.message}`, true);
                 console.error("Connection Error:", error);
                 statusText.textContent = "Connection failed";
                 statusDot.className = 'status-dot ended';

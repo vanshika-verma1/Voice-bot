@@ -13,7 +13,7 @@ load_dotenv()
 
 templates = Jinja2Templates(directory="templates")
 
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://localhost:7880")
+LIVEKIT_URL = os.getenv("LIVEKIT_PUBLIC_URL", os.getenv("LIVEKIT_URL", "ws://localhost:7880"))
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "devkey")
 LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "secret")
 
