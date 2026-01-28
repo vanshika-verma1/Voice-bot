@@ -4,3 +4,6 @@ service_account.json
 LICENSE
 bin
 rag/__pycache__
+config
+ngrok.yml
+livekit.yaml

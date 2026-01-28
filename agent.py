@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+import os
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -16,18 +17,15 @@ from livekit.agents import (
 from livekit.plugins import openai, deepgram, silero
 
 from src.session_summary import generate_session_summary
-from src.db_writer import save_conversation_summary
+from src.db import save_conversation_summary
 
 load_dotenv()
 
-import logging
-from loguru import logger
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+STT_MODEL = os.getenv("STT_MODEL", "nova-2")
+TTS_MODEL = os.getenv("TTS_MODEL", "aura-asteria-en")
 
-logging.getLogger("pymongo").handlers = []
-logging.getLogger("pymongo").propagate = False
-logging.getLogger("pymongo").setLevel(logging.WARNING)
-
-summary_llm = openai.LLM(model="gpt-4o-mini")
+summary_llm = openai.LLM(model=LLM_MODEL)
 
 class SessionState:
     def __init__(self):
@@ -164,10 +162,14 @@ async def entrypoint(ctx: JobContext):
     )
 
     session = AgentSession(
-        vad=silero.VAD.load(),
-        stt=deepgram.STT(model="nova-2"),
-        llm=openai.LLM(model="gpt-4o-mini"),
-        tts=deepgram.TTS(model="aura-asteria-en"),
+        vad=silero.VAD.load(
+            min_silence_duration=0.1,
+            activation_threshold=0.5,
+            prefix_padding_duration=0.1
+        ),
+        stt=deepgram.STT(model=STT_MODEL),
+        llm=openai.LLM(model=LLM_MODEL),
+        tts=deepgram.TTS(model=TTS_MODEL),
     )
 
     @session.on("conversation_item_added")

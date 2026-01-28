@@ -10,20 +10,9 @@ from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# Setup paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-if BASE_DIR not in sys.path:
-    sys.path.insert(0, BASE_DIR)
+from src.db import connect_db, close_db
 
-try:
-    from src.db import connect_db, close_db
-except ImportError:
-    # Fallback if src is not found
-    try:
-        from db import connect_db, close_db
-    except ImportError:
-        def connect_db(): print("MongoDB mock connect")
-        def close_db(): print("MongoDB mock close")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 load_dotenv()
 
@@ -39,9 +28,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -69,7 +60,6 @@ async def get_token():
         "room_name": room_name
     }
 
-# Serve the test website files
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
 
@@ -78,7 +68,6 @@ if __name__ == "__main__":
     print(f"🚀 Starting Server at http://localhost:8000")
     print(f"📁 Serving static files from: {STATIC_DIR}")
     
-    # Temporarily DISABLING reload to debug the infinite reload issue
     try:
         uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
     except Exception as e:

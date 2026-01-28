@@ -849,6 +849,22 @@
                 btnStop.disabled = false;
                 hideEmptyState();
 
+                // Handle Website Control Data Messages (for testing/logging)
+                room.on(RoomEvent.DataReceived, (payload, participant) => {
+                    const decoder = new TextDecoder();
+                    const strData = decoder.decode(payload);
+                    try {
+                        const data = JSON.parse(strData);
+                        if (data.type === 'WEBSITE_CONTROL') {
+                            const { action, target } = data;
+                            addMessage('', `[Command: ${action} -> ${target}]`, true);
+                        }
+                    } catch (e) {
+                        console.error("Failed to parse data message:", e);
+                    }
+                });
+
+
             } catch (error) {
                 // debugLog(`Connection Error: ${error.message}`, true);
                 console.error("Connection Error:", error);
