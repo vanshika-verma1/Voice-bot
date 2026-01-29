@@ -257,9 +257,14 @@ class SimpleAgent:
         from openai import AsyncOpenAI
         self._client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self.history = []
-        self.system_prompt = """You are a helpful voice assistant. Keep responses short and conversational.
-Respond in 1-2 sentences maximum. Be friendly and natural.
-If the user says goodbye, respond with a brief farewell."""
+        self.system_prompt = self._load_system_prompt()
+
+    def _load_system_prompt(self):
+        try:
+            with open("system_prompt.txt", "r", encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            return "You are a helpful voice assistant. Keep responses short and conversational."
 
     async def get_response(self, user_text: str):
         self.history.append({"role": "user", "content": user_text})
