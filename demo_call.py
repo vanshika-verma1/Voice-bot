@@ -36,12 +36,52 @@ app = FastAPI(title="Voice Agent Demo")
 app.add_middleware(SessionMiddleware, secret_key=os.getenv("SESSION_SECRET", "demo-secret-key"))
 
 templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 dg_client = DeepgramClient(DEEPGRAM_API_KEY, config=DeepgramClientOptions(options={"keepalive": "true"}))
 
+from db import connect_db, get_db
+connect_db()
+
 active_calls: Dict[str, dict] = {}
 transcript_connections: Dict[str, WebSocket] = {}
+
+
+def save_message(call_sid: str, role: str, content: str, phone_number: str = None):
+    """Save a chat message to MongoDB"""
+    db = get_db()
+    if db is None:
+        logger.warning("Database not connected, skipping message save")
+        return
+    try:
+        update_doc = {
+            "$push": {
+                "messages": {
+                    "role": role,
+                    "content": content,
+                    "timestamp": datetime.utcnow()
+                }
+            },
+            "$setOnInsert": {
+                "call_sid": call_sid,
+                "created_at": datetime.utcnow()
+            },
+            "$set": {
+                "updated_at": datetime.utcnow()
+            }
+        }
+        if phone_number:
+            update_doc["$setOnInsert"]["phone_number"] = phone_number
+        
+        db.phone_call_transcript.update_one(
+            {"call_sid": call_sid},
+            update_doc,
+            upsert=True
+        )
+        logger.info(f"Saved to DB: [{role}] {content[:50]}...")
+    except Exception as e:
+        logger.error(f"Failed to save message: {e}")
 
 
 class TTSManager:
@@ -335,9 +375,10 @@ async def hangup(request: Request):
 async def outbound_twiml(request: Request):
     base_url = SERVER_URL.replace("https://", "").replace("http://", "")
     stream_url = f"wss://{base_url}/media-stream"
+    greeting_url = f"https://{base_url}/static/greeting.wav"
     
     response = VoiceResponse()
-    response.pause(length=0.2)
+    response.play(greeting_url)
     connect = Connect()
     connect.stream(url=stream_url, name="voice_stream")
     response.append(connect)
@@ -367,6 +408,15 @@ async def call_status(request: Request):
     
     if status in ["completed", "failed", "busy", "no-answer", "canceled"]:
         active_calls.pop(call_sid, None)
+        db = get_db()
+        if db is not None:
+            try:
+                db.phone_call_transcript.update_one(
+                    {"call_sid": call_sid},
+                    {"$set": {"status": status, "ended_at": datetime.utcnow()}}
+                )
+            except Exception as e:
+                logger.error(f"Failed to update call status: {e}")
     
     return Response(status_code=200)
 
@@ -403,6 +453,7 @@ async def media_stream(ws: WebSocket):
     
     stream_sid = None
     call_sid = None
+    phone_number = None
     tts_manager = None
     agent = SimpleAgent()
     stop_tts_event = asyncio.Event()
@@ -513,6 +564,7 @@ async def media_stream(ws: WebSocket):
             
             if call_sid:
                 await broadcast_transcript(call_sid, "user", user_text)
+                save_message(call_sid, "user", user_text, phone_number)
             
             logger.info(f"USER: {user_text}")
             
@@ -546,6 +598,7 @@ async def media_stream(ws: WebSocket):
             
             if call_sid and full_response:
                 await broadcast_transcript(call_sid, "agent", full_response)
+                save_message(call_sid, "agent", full_response, phone_number)
             
             logger.info(f"AGENT: {full_response}")
             
@@ -581,6 +634,9 @@ async def media_stream(ws: WebSocket):
                 call_sid = data.get("start", {}).get("callSid")
                 
                 if call_sid:
+                    if call_sid in active_calls:
+                        phone_number = active_calls[call_sid].get("phone_number")
+                    
                     tts_manager = TTSManager(call_sid)
                     await tts_manager.setup()
                     
@@ -588,7 +644,8 @@ async def media_stream(ws: WebSocket):
                     
                     greeting = "Hello, how can I help you today?"
                     await broadcast_transcript(call_sid, "agent", greeting)
-                    await tts_manager.stream_tts_audio(ws, stream_sid, greeting, stop_tts_event)
+                    save_message(call_sid, "agent", greeting, phone_number)
+                    # await tts_manager.stream_tts_audio(ws, stream_sid, greeting, stop_tts_event)
                 
                 logger.info(f"Stream started: {call_sid}")
             

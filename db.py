@@ -7,14 +7,19 @@ load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
 
 mongo_client: MongoClient | None = None
-db = None
+_db = None
 
 
 def connect_db():
-    global mongo_client, db
+    global mongo_client, _db
     mongo_client = MongoClient(MONGO_URI)
-    db = mongo_client["voice_bot_db"]
+    _db = mongo_client["voice_bot_db"]
     print("✅ MongoDB connected")
+
+
+def get_db():
+    """Get the database instance"""
+    return _db
 
 
 def close_db():
