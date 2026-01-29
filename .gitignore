@@ -7,3 +7,4 @@ rag/__pycache__
 config
 ngrok.yml
 livekit.yaml
+src/__pycache__
