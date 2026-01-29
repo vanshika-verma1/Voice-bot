@@ -474,7 +474,7 @@ async def media_stream(ws: WebSocket):
     ratecv_state = None
     tts_already_cleared = {"value": False}
     
-    STRONG_PAUSE = 0.4
+    STRONG_PAUSE = 0.5
     WEAK_PAUSE = 0.7
     NO_PUNCT_PAUSE = 1.0
     
@@ -710,4 +710,4 @@ async def media_stream(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8125)
