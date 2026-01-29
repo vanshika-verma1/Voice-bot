@@ -79,7 +79,6 @@ def save_message(call_sid: str, role: str, content: str, phone_number: str = Non
             update_doc,
             upsert=True
         )
-        logger.info(f"Saved to DB: [{role}] {content[:50]}...")
     except Exception as e:
         logger.error(f"Failed to save message: {e}")
 
@@ -375,10 +374,11 @@ async def hangup(request: Request):
 async def outbound_twiml(request: Request):
     base_url = SERVER_URL.replace("https://", "").replace("http://", "")
     stream_url = f"wss://{base_url}/media-stream"
-    greeting_url = f"https://{base_url}/static/greeting.wav"
+    # greeting_url = f"https://{base_url}/static/greeting.wav"
     
     response = VoiceResponse()
-    response.play(greeting_url)
+    # response.play(greeting_url)  # TwiML greeting - commented out, using Deepgram TTS instead
+    response.pause(length=0.2)
     connect = Connect()
     connect.stream(url=stream_url, name="voice_stream")
     response.append(connect)
@@ -469,9 +469,9 @@ async def media_stream(ws: WebSocket):
     ratecv_state = None
     tts_already_cleared = {"value": False}
     
-    STRONG_PAUSE = 0.5
-    WEAK_PAUSE = 0.8
-    NO_PUNCT_PAUSE = 1.2
+    STRONG_PAUSE = 0.4
+    WEAK_PAUSE = 0.7
+    NO_PUNCT_PAUSE = 1.0
     
     STRONG_PUNCT_RE = re.compile(r'[.!?]+$')
     WEAK_PUNCT_RE = re.compile(r'[,;:]$')
@@ -645,7 +645,7 @@ async def media_stream(ws: WebSocket):
                     greeting = "Hello, how can I help you today?"
                     await broadcast_transcript(call_sid, "agent", greeting)
                     save_message(call_sid, "agent", greeting, phone_number)
-                    # await tts_manager.stream_tts_audio(ws, stream_sid, greeting, stop_tts_event)
+                    await tts_manager.stream_tts_audio(ws, stream_sid, greeting, stop_tts_event)
                 
                 logger.info(f"Stream started: {call_sid}")
             
